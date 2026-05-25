@@ -261,7 +261,21 @@ async fn main(spawner: Spawner) {
         // a round this equals current_sf_index (no-op); on the last it points
         // to the next entry in the SF sweep table, and we retune so we can
         // hear the very first ping of the new round.
-        if ping.next_sf_index != current_sf_index {
+        //
+        // Defensive bounds-check: a corrupted byte 9 that escapes the hardware
+        // CRC (rare but observed in field captures — ~1/65k packets) would
+        // otherwise let an out-of-range next_sf_index latch in and strand the
+        // receiver. Reject anything outside [0, SF_TABLE.len()).
+        if (ping.next_sf_index as usize) >= SF_TABLE_LEN {
+            warn!(
+                "ignoring out-of-range next_sf_index={} (CRC-escaped corruption?)",
+                ping.next_sf_index
+            );
+            host_log!(
+                "ignoring out-of-range next_sf_index={}",
+                ping.next_sf_index
+            );
+        } else if ping.next_sf_index != current_sf_index {
             info!(
                 "follow SF: {} -> {}",
                 7 + current_sf_index,
@@ -276,3 +290,5 @@ async fn main(spawner: Spawner) {
         }
     }
 }
+
+const SF_TABLE_LEN: usize = 6;
