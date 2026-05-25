@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+
+# Rust (firmware/)
+firmware/target/
+firmware/**/*.rs.bk
+
+# Claude Code per-project memory database (auto-generated, contains local context)
+**/ruvector.db
+**/*.db
+firmware/.claude/
+
+# IntelliJ / Android Studio / VS Code
+.idea/
+.vscode/
+*.iml
+*.iws
+
+# Flutter (companion/)
+companion/.dart_tool/
+companion/.flutter-plugins
+companion/.flutter-plugins-dependencies
+companion/.packages
+companion/build/
+companion/.pub/
+
+# Flutter iOS
+companion/ios/Flutter/Flutter.framework/
+companion/ios/Flutter/Flutter.podspec
+companion/ios/Pods/
+companion/ios/.symlinks/
+companion/ios/Podfile.lock
+companion/ios/Runner.xcworkspace/xcuserdata/
+companion/ios/Runner.xcodeproj/xcuserdata/
+companion/ios/Runner.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Flutter macOS
+companion/macos/Pods/
+companion/macos/.symlinks/
+companion/macos/Podfile.lock
+companion/macos/Flutter/ephemeral/
+companion/macos/Runner.xcworkspace/xcuserdata/
+companion/macos/Runner.xcodeproj/xcuserdata/
+companion/macos/Runner.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Misc
+*.log
+*.swp
+*~

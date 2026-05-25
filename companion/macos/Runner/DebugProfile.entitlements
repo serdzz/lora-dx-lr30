@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App sandbox is intentionally OFF: macOS blocks character-device opens
+	     on /dev/cu.usbmodem* from sandboxed apps, and the
+	     `temporary-exception.files.absolute-path.read-write` workaround is
+	     deprecated and silently ignored. This is a local dev tool, not an
+	     App Store build, so disabling sandbox is the right call. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>
