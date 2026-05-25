@@ -79,7 +79,7 @@ them without bumping `version` as long as readers default-init them to 0.
 | IQ inversion        | off                                                   |
 
 Per-SF sensitivity, ToA, and expected real-world range are tabulated in
-[`speed-vs-range.md`](../firmware/docs/speed-vs-range.md).
+[`speed-vs-range.md`](speed-vs-range.md).
 
 ### SF coordination
 
