@@ -2,8 +2,8 @@
 name = "lora-dx-lr30-range-test"
 version = "0.1.0"
 edition = "2021"
-description = "LoRa range test for two DX-SMART DX-LR30 (SX1278) modules on STM32F103C8 BluePill"
-license = "MIT OR Apache-2.0"
+description = "LoRa range test for two DX-SMART DX-LR30 (SX1262) modules on STM32F103C8T6 BluePill"
+license = "MIT"
 
 [lib]
 name = "lora_dx_lr30"

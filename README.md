@@ -75,4 +75,4 @@ app for the GPS half.
 
 ## License
 
-MIT OR Apache-2.0 (same as the Cargo manifest of the firmware crate).
+[MIT](LICENSE) © 2026 Sergej Lepin.
