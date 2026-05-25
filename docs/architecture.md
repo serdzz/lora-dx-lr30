@@ -81,6 +81,42 @@ them without bumping `version` as long as readers default-init them to 0.
 Per-SF sensitivity, ToA, and expected real-world range are tabulated in
 [`speed-vs-range.md`](speed-vs-range.md).
 
+### Packet parameters (`lora.create_rx_packet_params` / `create_tx_packet_params`)
+
+The RX side of lora-phy needs one more argument than TX (`max_payload_length`)
+because the receiver pre-allocates a buffer; on TX the length is implicit from
+the byte slice you pass to `prepare_for_tx`. Otherwise the two sides take the
+same parameter set, and the values **must match exactly** on both ends — a
+mismatch on any of them and the receiver silently never decodes.
+
+```rust
+// Source: lora-phy 3.0.1, src/lib.rs:108
+pub fn create_rx_packet_params(
+    &mut self,
+    preamble_length: u16,
+    implicit_header: bool,
+    max_payload_length: u8,
+    crc_on: bool,
+    iq_inverted: bool,
+    modulation_params: &ModulationParams,
+) -> Result<PacketParams, RadioError>
+```
+
+| # | Field                | Type   | Meaning                                                                                            | Our value                |
+|---|----------------------|--------|----------------------------------------------------------------------------------------------------|--------------------------|
+| 1 | `preamble_length`    | `u16`  | Preamble symbol count                                                                              | `PREAMBLE_LEN = 8`       |
+| 2 | `implicit_header`    | `bool` | `false` = explicit header (length/CR/CRC bits in-band); `true` = receiver knows length up-front    | `false`                  |
+| 3 | `max_payload_length` | `u8`   | Max payload bytes — sizes the SX126x RX buffer and filters oversize frames *(RX only)*             | `MAX_LORA_PAYLOAD = 32`  |
+| 4 | `crc_on`             | `bool` | Enable hardware CRC16-CCITT over payload. On RX, CRC failure raises `IRQ_CRC_ERROR` (frame dropped) | `true`                  |
+| 5 | `iq_inverted`        | `bool` | Invert I/Q polarity. LoRaWAN gateway→device uses this; for peer-to-peer keep `false` on both ends   | `false`                  |
+| 6 | `modulation_params`  | `&ModulationParams` | SF/BW/CR/freq tuple from `create_modulation_params`. SF-selective, so an SF mismatch means total deafness | `&mod_params` |
+
+`create_tx_packet_params` is identical minus parameter 3 (`max_payload_length`):
+
+```rust
+create_tx_packet_params(preamble_length, implicit_header, crc_on, iq_inverted, mod_params)
+```
+
 ### SF coordination
 
 Naive approach (broken): node_a switches SF unilaterally, embeds the new SF in
