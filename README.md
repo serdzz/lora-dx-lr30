@@ -26,6 +26,7 @@ walking → │ node_a (PING initiator)│      iPhone ─ GPS trace ──┐
 |----------------|---------------------------------------------------------|
 | `firmware/`    | Rust embedded firmware (Embassy + lora-phy). Two `[[bin]]`s: `node_a` (PING/SF sweep) and `node_b` (PONG/follow-SF). |
 | `companion/`   | Flutter app — macOS reads `node_b`'s UART log, iOS records GPS, both merged into a map. |
+| `docs/architecture.md` | End-to-end architecture: packet format, SF handoff, tasks, data flow, hardware quirks. |
 | `firmware/docs/speed-vs-range.md` | Sensitivity / ToA / energy / typical range per SF — pick which SF to use for which test. |
 
 Each subdirectory has its own README + setup steps.
