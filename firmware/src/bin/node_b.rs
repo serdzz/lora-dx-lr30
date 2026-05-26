@@ -121,6 +121,15 @@ async fn main(spawner: Spawner) {
     // (see the `Err(_elapsed)` arm below) if the handoff window is lost.
     let mut current_sf_index: u8 = 0;
 
+    // Fast-scan on cold-start: scan the SF table at 5 s/SF (full table in
+    // 30 s) until the first packet is received, then switch to 60 s dwell.
+    // Motivation: after a power-bank reboot, node_b can be tens of minutes
+    // out of sync with node_a's sweep. With 60 s dwell, worst-case sync
+    // takes 6 × 60 s = 6 min — long enough that a low-current power-bank
+    // re-cuts before the link comes up. 5 s/SF gives a full search in
+    // 30 s, well under any reasonable bank's idle-cutoff window.
+    let mut synced: bool = false;
+
     loop {
         let sf = sf_from_index(current_sf_index);
         let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
@@ -154,18 +163,22 @@ async fn main(spawner: Spawner) {
             continue;
         }
 
-        // 60-second app-level rx timeout. If nothing arrives — either the
-        // initiator is out of range (benign, just re-arm) or the radio /
-        // DIO1 has wedged silently (the IWDG won't catch this, because the
-        // executor is still alive — only this future is stuck). Either way,
-        // dropping out of `rx` and re-running prepare_for_rx fully re-arms
-        // the SX1262 receive path, which is the cheapest recovery short of
-        // a hard reset.
-        let rx_outcome = with_timeout(
-            Duration::from_secs(60),
-            lora.rx(&rx_pkt_params, &mut rx_buf),
-        )
-        .await;
+        // App-level rx timeout. Two modes:
+        //   - !synced (cold-start, fast-scan): 5 s per SF — full table
+        //     covered in 30 s. Keeps the link find time well under any
+        //     reasonable power-bank's idle-current cutoff (~30-60 s).
+        //   - synced (normal operation): 60 s per SF — recovery path when
+        //     the HANDOFF_TAIL window is lost or the user walks out of
+        //     range temporarily. See "Reliability" in docs/architecture.md.
+        //
+        // The dwell switches to 60 s on the first successful packet decode
+        // (where `synced` flips to true) and stays there until reset/reboot.
+        let dwell = if synced {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(5)
+        };
+        let rx_outcome = with_timeout(dwell, lora.rx(&rx_pkt_params, &mut rx_buf)).await;
         let (len, status) = match rx_outcome {
             Ok(Ok(x)) => x,
             Ok(Err(RadioError::ReceiveTimeout)) => continue,
@@ -174,21 +187,21 @@ async fn main(spawner: Spawner) {
                 continue;
             }
             Err(_elapsed) => {
-                // 60 s of silence: backup recovery path for the case where
-                // the entire HANDOFF_TAIL window was lost and we're stuck on
-                // the previous round's SF while node_a has already moved on.
-                // Step our own SF forward; within at most SF_TABLE.len()
-                // timeouts (≤ 6 minutes worst-case) we'll land on whatever
-                // SF node_a is now transmitting.
+                // Timeout reached without a packet — step our own SF
+                // forward. In fast-scan that's 5 s; in normal mode it's
+                // 60 s.
                 let prev = current_sf_index;
                 current_sf_index = (current_sf_index + 1) % (SF_TABLE.len() as u8);
+                let secs = dwell.as_secs();
                 warn!(
-                    "rx silent 60s — scanning SF {} -> {}",
+                    "rx silent {}s — scanning SF {} -> {}",
+                    secs,
                     7 + prev,
                     7 + current_sf_index
                 );
                 host_log!(
-                    "rx silent 60s — scanning SF {} -> {}",
+                    "rx silent {}s — scanning SF {} -> {}",
+                    secs,
                     7 + prev,
                     7 + current_sf_index
                 );
@@ -209,6 +222,13 @@ async fn main(spawner: Spawner) {
         };
         if ping.kind as u8 != Kind::Ping as u8 {
             continue;
+        }
+
+        // First good packet after cold-start — leave fast-scan mode.
+        if !synced {
+            synced = true;
+            info!("synced on SF{} — switching to 60s dwell", 7 + ping.sf_index);
+            host_log!("synced on SF{} — switching to 60s dwell", 7 + ping.sf_index);
         }
 
         led.toggle();
