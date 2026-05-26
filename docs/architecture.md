@@ -232,6 +232,9 @@ the buffer is congested.
 
 ### Reliability (node_b only)
 
+Two layers of self-recovery so a stationary receiver left in the field for
+hours doesn't quietly die in an unrecoverable state.
+
 ```
                        ┌─────────────────────┐
                        │ HW watchdog (IWDG)  │  8 s timeout, pet every 2 s
@@ -241,15 +244,65 @@ the buffer is congested.
                        └─────────────────────┘
                        ┌─────────────────────┐
                        │ App rx-timeout      │  60 s on lora.rx()
-                       │ catches: silent     │  enter_standby + re-arm
-                       │  SX1262 wedge       │  (sweep mode advances SF too)
+                       │ catches: silent     │  enter_standby + advance SF
+                       │  SX1262 wedge       │  + re-arm
                        │  with live executor │
                        └─────────────────────┘
 ```
 
-node_a doesn't need either — its loop has natural per-ping progress (TX → RX
-single-mode with `RX_SYMBOL_TIMEOUT`), so a stuck radio just produces a stream
-of `miss` log lines without freezing anything.
+#### Hardware watchdog (`watchdog_task` in `node_b.rs`)
+
+The STM32F1's **IWDG** is a hardware countdown timer clocked from **LSI**
+(40 kHz internal RC oscillator) — independent of SYSCLK, so it keeps ticking
+even if the core is in a hard-fault, lockup, or running under a debugger.
+When the counter reaches zero, the chip is hardware-reset.
+
+```rust
+#[embassy_executor::task]
+async fn watchdog_task(iwdg: IWDG) {
+    let mut wdt = IndependentWatchdog::new(iwdg, 8_000_000);  // 8 s timeout
+    wdt.unleash();                                            // start (irreversible)
+    loop {
+        Timer::after(Duration::from_secs(2)).await;
+        wdt.pet();                                            // reload to 8 s
+    }
+}
+```
+
+The IWDG fires `8 / 2 = 4×` the pet interval, so a single missed pet is fine —
+it's only when 3+ pets in a row are missed that the chip resets. `unleash()`
+**cannot be undone**: once called, only a full power-cycle stops the IWDG.
+
+**Why a separate task instead of petting from the main loop**: at SF12 the
+main loop legitimately sits in `lora.rx().await` for up to the full 60 s
+app-level timeout. If we petted from inside that branch, the IWDG would
+fire mid-receive every time — false alarm. A separate task that wakes every
+2 s pets independently as long as the **executor is alive**, regardless of
+what main is doing.
+
+| Failure mode                                         | Caught by IWDG? | Why                                                  |
+|------------------------------------------------------|-----------------|------------------------------------------------------|
+| Hard fault / bus fault / panic loop                  | ✓               | Executor dead → task never scheduled → no pet        |
+| Cortex-M lockup                                      | ✓               | Core halted, but IWDG runs from LSI                  |
+| Stack overflow → hard fault                          | ✓               | Same as above                                        |
+| Tight `loop {}` without `.await` in any task         | ✓               | Cooperative scheduler starved → watchdog_task stuck  |
+| `lora.rx().await` waiting for an IRQ that never fires | ✗              | Executor alive, watchdog_task still pets every 2 s  |
+| Silent SPI deadlock inside lora-phy                  | ✗               | Same — that's what the app-level `with_timeout` catches |
+
+#### Application-level rx-timeout
+
+`with_timeout(Duration::from_secs(60), lora.rx(…))` wraps the main RX-await.
+On timeout it puts the chip back in standby, advances `current_sf_index` by
+one, and re-runs `prepare_for_rx` — covering both the "out of range"
+benign case and the "DIO1 wedged with executor alive" pathological case
+that IWDG can't see.
+
+#### Why `node_a` doesn't need either
+
+node_a's loop has natural per-ping progress: TX → RX-single-mode with the
+`RX_SYMBOL_TIMEOUT` symbol count → next iteration. A stuck radio there
+just produces a stream of `miss` log lines without ever freezing the
+executor, so the IWDG would have no work to do.
 
 ## Companion app (Flutter)
 
