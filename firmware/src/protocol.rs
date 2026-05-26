@@ -10,6 +10,20 @@ pub const TX_POWER_DBM: i32 = 22;
 
 pub const PINGS_PER_SF: u16 = 20;
 
+/// Number of *trailing* pings in a round that advertise the next SF instead of
+/// the current one. Bigger window = more resilient against the last-ping loss
+/// that would otherwise desync node_b from node_a on every SF transition.
+///
+/// Cost: node_b switches as soon as it sees the first ping with the new
+/// `next_sf_index`, so the last (HANDOFF_TAIL−1) pings of every round are
+/// missed deliberately by node_b — node_a sees those as PER, but the
+/// (PINGS_PER_SF−HANDOFF_TAIL) earlier pings still give a clean measurement
+/// at the round's actual SF.
+///
+/// With per-ping reliability p, the probability of total handoff loss is
+/// (1−p)^HANDOFF_TAIL. At p=0.7 (pessimistic): 2.7%. At p=0.9: 0.1%.
+pub const HANDOFF_TAIL: u16 = 3;
+
 pub const SF_TABLE: [SpreadingFactor; 6] = [
     SpreadingFactor::_7,
     SpreadingFactor::_8,

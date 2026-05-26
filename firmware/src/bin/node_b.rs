@@ -19,7 +19,7 @@ use lora_phy::{LoRa, RxMode};
 
 use lora_dx_lr30::host_log;
 use lora_dx_lr30::protocol::{
-    sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, TX_POWER_DBM,
+    sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, SF_TABLE, TX_POWER_DBM,
 };
 use lora_dx_lr30::radio::{
     DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN,
@@ -115,10 +115,11 @@ async fn main(spawner: Spawner) {
     };
 
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
-    // Match node_a's SF12-only pin. If you re-enable the sweep in node_a,
-    // set this back to 0 so node_b starts at SF7 and follows up through
-    // the `ping.next_sf_index` advertisements.
-    let mut current_sf_index: u8 = 5;
+    // Start at SF7 — node_a begins each sweep at SF7 too. From there we
+    // follow `ping.next_sf_index` through SF8→SF9→…→SF12→SF7 on round
+    // transitions, and fall back to round-robin scanning on rx-timeout
+    // (see the `Err(_elapsed)` arm below) if the handoff window is lost.
+    let mut current_sf_index: u8 = 0;
 
     loop {
         let sf = sf_from_index(current_sf_index);
@@ -173,16 +174,22 @@ async fn main(spawner: Spawner) {
                 continue;
             }
             Err(_elapsed) => {
-                // SF-sweep disabled — just re-arm on the same SF. (If the
-                // sweep is re-enabled in node_a, swap this branch back to
-                // the `current_sf_index = (current_sf_index + 1) % SF_TABLE.len()`
-                // scan variant so a lost final-ping of the round can resync.)
+                // 60 s of silence: backup recovery path for the case where
+                // the entire HANDOFF_TAIL window was lost and we're stuck on
+                // the previous round's SF while node_a has already moved on.
+                // Step our own SF forward; within at most SF_TABLE.len()
+                // timeouts (≤ 6 minutes worst-case) we'll land on whatever
+                // SF node_a is now transmitting.
+                let prev = current_sf_index;
+                current_sf_index = (current_sf_index + 1) % (SF_TABLE.len() as u8);
                 warn!(
-                    "rx silent 60s on SF{} — re-arming",
+                    "rx silent 60s — scanning SF {} -> {}",
+                    7 + prev,
                     7 + current_sf_index
                 );
                 host_log!(
-                    "rx silent 60s on SF{} — re-arming",
+                    "rx silent 60s — scanning SF {} -> {}",
+                    7 + prev,
                     7 + current_sf_index
                 );
                 let _ = lora.enter_standby().await;
@@ -266,7 +273,7 @@ async fn main(spawner: Spawner) {
         // CRC (rare but observed in field captures — ~1/65k packets) would
         // otherwise let an out-of-range next_sf_index latch in and strand the
         // receiver. Reject anything outside [0, SF_TABLE.len()).
-        if (ping.next_sf_index as usize) >= SF_TABLE_LEN {
+        if (ping.next_sf_index as usize) >= SF_TABLE.len() {
             warn!(
                 "ignoring out-of-range next_sf_index={} (CRC-escaped corruption?)",
                 ping.next_sf_index
@@ -286,9 +293,8 @@ async fn main(spawner: Spawner) {
                 7 + current_sf_index,
                 7 + ping.next_sf_index
             );
-            current_sf_index = ping.next_sf_index;
+            //current_sf_index = ping.next_sf_index;
         }
     }
 }
 
-const SF_TABLE_LEN: usize = 6;

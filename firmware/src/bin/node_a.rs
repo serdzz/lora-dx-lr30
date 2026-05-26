@@ -18,7 +18,8 @@ use lora_phy::{LoRa, RxMode};
 
 use lora_dx_lr30::host_log;
 use lora_dx_lr30::protocol::{
-    sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, PINGS_PER_SF, TX_POWER_DBM,
+    sf_from_index, Kind, Packet, FREQ_HZ, HANDOFF_TAIL, PACKET_LEN, PINGS_PER_SF, SF_TABLE,
+    TX_POWER_DBM,
 };
 use lora_dx_lr30::radio::{
     DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN, RX_SYMBOL_TIMEOUT,
@@ -107,9 +108,8 @@ async fn main(spawner: Spawner) {
     };
 
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
-    // Pinned to SF12 (index 5 in SF_TABLE = [SF7, SF8, SF9, SF10, SF11, SF12]).
-    // Max range, ~0.4 pings/sec, ~2.5 s per round-trip.
-    let sf_index: u8 = 5;
+    // Sweep mode: SF7 → SF8 → … → SF12 → SF7. Indexes 0..5 of SF_TABLE.
+    let mut sf_index: u8 = 0;
 
     loop {
         let sf = sf_from_index(sf_index);
@@ -130,9 +130,15 @@ async fn main(spawner: Spawner) {
         info!("=== SF{} round start ({} pings) ===", 7 + sf_index, PINGS_PER_SF);
 
         for seq in 0..PINGS_PER_SF {
-            // SF-sweep disabled — pinned to SF12. `next_sf_index = sf_index`
-            // on every ping means node_b never transitions.
-            let next_sf_index = sf_index;
+            // Robust SF handoff: in the LAST `HANDOFF_TAIL` pings of the round,
+            // advertise the next SF. node_b switches on the FIRST one it
+            // receives, so even if 2 of 3 are lost, sync survives. Earlier
+            // pings keep `next_sf_index = sf_index` (no-op for node_b).
+            let next_sf_index = if seq + HANDOFF_TAIL >= PINGS_PER_SF {
+                (sf_index + 1) % (SF_TABLE.len() as u8)
+            } else {
+                sf_index
+            };
             let pkt = Packet {
                 kind: Kind::Ping,
                 sf_index,
@@ -277,9 +283,8 @@ async fn main(spawner: Spawner) {
             );
         }
 
-        // SF-sweep disabled — pinned to SF12 (sf_index=5). next_sf_index in
-        // every ping = sf_index, so node_b stays on SF12 too.
-        // sf_index = (sf_index + 1) % (SF_TABLE.len() as u8);
+        // Advance to the next SF in the table; wraps SF12 → SF7.
+        sf_index = (sf_index + 1) % (SF_TABLE.len() as u8);
         Timer::after_millis(500).await;
     }
 }
