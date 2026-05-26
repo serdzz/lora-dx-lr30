@@ -410,6 +410,11 @@ Two-pane macOS layout: a 320 px side panel over a `FlutterMap` + OSM tiles.
 
 ![Merge & map, Kaugurciems range test](images/merge-map-kaugurciems.png)
 
+The raw inputs for this exact run are checked in under
+[`docs/sample-data/`](sample-data/): `lora_20260526_192757.csv` (2812 hits)
+and `gps_20260526_192629.csv` (4033 fixes) — load both into the Merge & map
+screen to reproduce the map above.
+
 Worked example (above), a Kaugurciems/Jūrmala walk: **2812 LoRa events** and
 **4033 GPS fixes** collapse to **818 mapped points** — and note the tolerance is
 cranked to **29 s**, near the slider max. That low yield at a wide window is the
