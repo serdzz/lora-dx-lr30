@@ -384,6 +384,33 @@ companion/lib/
 (binary-search nearest fix per LoRa hit, drop if `|delta| > maxDelta`,
 default 5 s) → `flutter_map` Markers coloured by RSSI (green → red).
 
+### Merge & map screen (`map_screen.dart`)
+
+Two-pane macOS layout: a 320 px side panel over a `FlutterMap` + OSM tiles.
+
+- **Load lora.csv / Load gps.csv** — `file_selector` open dialogs. Header row
+  (`timestamp_iso…`) is skipped; unparseable rows are silently dropped, so the
+  counts shown ("N events" / "N fixes") are *parsed* rows, not file lines.
+- **Join tolerance** — slider 1–30 s, wired to `maxDelta`. Every change
+  re-runs `mergeByTimestamp()` synchronously. The label restates the rule:
+  a LoRa hit is dropped if the nearest GPS fix is more than `maxDelta` away.
+- **Merged** — count of mapped points + **Export merged.csv** (`getSaveLocation`,
+  writes `MergedPoint.csvHeader` + rows, then a snackbar with the path).
+- The GPS track is drawn as a blue-grey polyline (all fixes, when ≥ 2); only
+  *matched* hits become RSSI-coloured dots via `_RssiDot.colorFor()`
+  (`lerp` red→green over −120…−50 dBm; unmatched/null RSSI defaults to −130).
+
+![Merge & map, Kaugurciems range test](images/merge-map-kaugurciems.png)
+
+Worked example (above), a Kaugurciems/Jūrmala walk: **2812 LoRa events** and
+**4033 GPS fixes** collapse to **818 mapped points** — and note the tolerance is
+cranked to **29 s**, near the slider max. That low yield at a wide window is the
+tell-tale of *sparse, gappy* GPS recording (the iOS auto-pause / background
+suspension fixed in `location_service.dart`): with a dense, gap-free track most
+hits match inside the 5 s default. The spatial story reads correctly though —
+strong green dots cluster at the start point, browns fan out, and the few reds
+sit at the far edge of the walk, i.e. clean distance-vs-RSSI falloff.
+
 ### Parser shapes
 
 The serial stream from `node_b` is a mix of free-form log lines plus a few
