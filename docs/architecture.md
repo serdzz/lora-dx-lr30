@@ -44,6 +44,14 @@ Two physical USB cables involved during a session:
 - USB-C cable → BluePill USB-C → CH340 → MCU USART1 (the data path during
   the actual range test)
 
+![Bench setup: both DX-LR30 nodes off a 120 W power bank](images/bench-setup.jpg)
+
+Bench bring-up of both nodes: top board carries the whip antenna with its
+blue link LED lit (active radio), the bottom DX-LR30 has the SMA antenna and
+its red power LED on. Both run untethered off a single 120 W USB-C power bank
+(~90 %), which is how the base node stays alive through a multi-hour SF sweep
+without a wall socket.
+
 ## LoRa link layer
 
 ### Packet format (12 bytes, little-endian)
