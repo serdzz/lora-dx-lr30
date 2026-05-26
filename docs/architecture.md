@@ -291,11 +291,39 @@ what main is doing.
 
 #### Application-level rx-timeout
 
-`with_timeout(Duration::from_secs(60), lora.rx(…))` wraps the main RX-await.
-On timeout it puts the chip back in standby, advances `current_sf_index` by
-one, and re-runs `prepare_for_rx` — covering both the "out of range"
-benign case and the "DIO1 wedged with executor alive" pathological case
-that IWDG can't see.
+`with_timeout(dwell, lora.rx(…))` wraps the main RX-await. On timeout it
+puts the chip back in standby, advances `current_sf_index` by one, and
+re-runs `prepare_for_rx` — covering both the "out of range" benign case
+and the "DIO1 wedged with executor alive" pathological case that IWDG
+can't see.
+
+The `dwell` value is **state-dependent** — see fast-scan below.
+
+#### Cold-start fast-scan (`synced` flag)
+
+After any reboot (power-bank cycle, IWDG reset, brown-out), `node_b`
+doesn't know what SF `node_a` is currently transmitting at. Worst-case
+sync time at the normal 60 s/SF dwell would be `SF_TABLE.len() × 60 s =
+6 min` — longer than the idle-current cutoff window on most consumer
+power-banks (~30-60 s with no load > 50 mA), so a bank would keep
+power-cycling the receiver and never let the link come up.
+
+The fix is a per-mode dwell, gated on a `synced: bool` initialised to
+`false` and flipped to `true` on the first successful `Packet::decode`:
+
+| Mode           | Condition  | Dwell per SF | Full-table scan time |
+|----------------|------------|--------------|----------------------|
+| Fast-scan      | `!synced`  | **5 s**      | 30 s                 |
+| Normal         | `synced`   | 60 s         | 6 min (recovery only) |
+
+5 seconds is enough to catch at least one ping at any SF (worst-case is
+SF12 with ~2.5 s per ping → 1-2 pings inside a 5 s window). Once a packet
+is decoded, the flag flips permanently for that boot — subsequent
+out-of-range gaps go through the 60 s recovery dwell, not the fast scan.
+The flag resets to `false` only on the next chip reset, which is exactly
+when fast-scan is wanted again.
+
+Cost: ~+600 bytes of Flash, no impact on Pong reply latency once synced.
 
 #### Why `node_a` doesn't need either
 
