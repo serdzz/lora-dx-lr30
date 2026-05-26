@@ -123,31 +123,56 @@ Naive approach (broken): node_a switches SF unilaterally, embeds the new SF in
 the next packet. Doesn't work — LoRa is SF-selective, so node_b can't decode a
 packet at the SF it isn't currently tuned to. Chicken-and-egg.
 
-Working approach: `next_sf_index` is **telegraphed one ping ahead**:
+Working approach: `next_sf_index` is **telegraphed over a HANDOFF_TAIL-ping
+window** at the end of each round, not just the single final ping. Defined in
+`protocol.rs::HANDOFF_TAIL = 3`.
 
 ```
-node_a (sf_index=K)  ──→ PING(sf_index=K, next_sf_index=K)        ─→ ...
-                         (19 such pings, the round)
+node_a (sf_index=K)  ──→ PING(sf_index=K, next_sf_index=K)        ─→ pings 0..16
+                         (17 such pings; node_b stays on K)
 
-node_a (sf_index=K)  ──→ PING(sf_index=K, next_sf_index=K+1)      ─→ last ping
-node_b receives, sends PONG at K, then sets current_sf_index = K+1
+node_a (sf_index=K)  ──→ PING(sf_index=K, next_sf_index=K+1)      ─→ pings 17,18,19
+                         (3-ping handoff window — same `next_sf_index` repeated)
+                         node_b updates current_sf_index on the FIRST one it
+                         receives. After that node_b is on K+1, so the remaining
+                         pings of this round at K are missed (node_a logs PER).
 
 node_a (sf_index=K+1) ─→ PING(sf_index=K+1, next_sf_index=K+1)    ─→ next round
-node_b is already on K+1, demodulates fine
+                         node_b is already on K+1, demodulates fine.
 ```
 
-Edge case: if the *last* ping of a round is lost, node_a switches SF but
-node_b doesn't, and they desync until either:
+The single-ping handoff used to desync on every lost final ping. With the
+3-ping window, only 1 of 3 needs to make it through:
 
-- node_a wraps the sweep back to K (worst-case wait: full sweep, ~3 minutes
-  for SF7..SF12), OR
-- node_b's app-level 60 s rx-timeout fires and (when sweep is enabled)
-  advances `current_sf_index` by one — within ≤6 timeouts node_b lands on
-  the same SF as node_a
+| Per-ping reliability p | Single-ping handoff loss | 3-ping handoff loss |
+|------------------------|--------------------------|---------------------|
+| p = 0.9                | 10 %                     | 0.1 %               |
+| p = 0.7                | 30 %                     | 2.7 %               |
+| p = 0.5                | 50 %                     | 12.5 %              |
 
-Pinned-SF mode (currently active for SF12-only tests) disables both halves of
-this — both bins hardcode `sf_index = 5`, `next_sf_index = sf_index`, no
-transition signal, no scan on timeout.
+**Cost**: when handoff lands on the first of the three pings, node_b retunes
+early and node_a sees the remaining 1–2 trailing pings as PER. Effective
+measurement window per SF is `PINGS_PER_SF − HANDOFF_TAIL = 17` pings.
+
+**Backup recovery (full window loss)**: on every 60 s rx-timeout, `node_b`
+steps `current_sf_index = (current_sf_index + 1) % SF_TABLE.len()` and
+re-arms. So even if all three handoff pings are lost, node_b walks the SF
+table until it lands on node_a's current SF — worst-case wait is
+`SF_TABLE.len() × 60 s = 6 min`. See the `Err(_elapsed)` arm in
+`node_b.rs`'s main loop.
+
+**Defensive bounds-check**: `node_b` rejects any `ping.next_sf_index` outside
+`[0, SF_TABLE.len())` with `warn!("ignoring out-of-range …")` instead of
+latching it in. A real field-capture (Mar 25, `lora_20260525_183403.csv`)
+showed a corrupted byte 9 escaping the hardware CRC and stranding the
+receiver on SF index 6; without the check the link was stuck for the rest
+of the session.
+
+To pin to a single SF instead (e.g. for SF12-only range tests), edit both
+bins to set `sf_index = 5` / `current_sf_index = 5`, change node_a's
+`next_sf_index` computation to a constant `sf_index`, and disable the scan
+arm in node_b. node_a's sweep advance at the end of each round should also
+be commented out.
 
 ### Round timing
 
