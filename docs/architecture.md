@@ -415,14 +415,25 @@ The raw inputs for this exact run are checked in under
 and `gps_20260526_192629.csv` (4033 fixes) — load both into the Merge & map
 screen to reproduce the map above.
 
-Worked example (above), a Kaugurciems/Jūrmala walk: **2812 LoRa events** and
-**4033 GPS fixes** collapse to **818 mapped points** — and note the tolerance is
-cranked to **29 s**, near the slider max. That low yield at a wide window is the
-tell-tale of *sparse, gappy* GPS recording (the iOS auto-pause / background
-suspension fixed in `location_service.dart`): with a dense, gap-free track most
-hits match inside the 5 s default. The spatial story reads correctly though —
-strong green dots cluster at the start point, browns fan out, and the few reds
-sit at the far edge of the walk, i.e. clean distance-vs-RSSI falloff.
+Worked example (above), a Kaugurciems/Jūrmala walk: **2812 LoRa events**
+(of which **1062 are `hit`** — only hits get merged) and **4033 GPS fixes**
+collapse to **818 mapped points** at a **29 s** tolerance (821 at 30 s, the
+exported `merged.csv`). That low yield at a wide window is the tell-tale of
+*sparse, gappy* GPS recording (the iOS auto-pause / background suspension fixed
+in `location_service.dart`): with a dense, gap-free track most hits match inside
+the 5 s default. The spatial story still reads correctly — strong green dots
+cluster at the start point, browns fan out, and the few reds sit at the far edge
+of the walk, i.e. clean distance-vs-RSSI falloff.
+
+> ⚠️ **The edge of the map is not the edge of the link.** The merge can only
+> place a hit where there's a GPS fix within tolerance, so the last dot marks
+> where *GPS recording* ended, not where reception stopped. In this run GPS died
+> at 19:24:21 while `node_b` kept logging hits until 19:27:55 — **154 successful
+> pings (≈3.5 min of walking) have no fix to anchor them** and never reach the
+> map, plus a 197 s GPS gap mid-walk dropped more. The link's true maximum range
+> was visibly farther (the node LED kept blinking past the last mapped point).
+> Always cross-check `lora_*.csv`'s last hit timestamp against `gps_*.csv`'s last
+> fix before reading range off the map.
 
 ### Parser shapes
 
