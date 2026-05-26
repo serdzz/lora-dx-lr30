@@ -293,8 +293,7 @@ async fn main(spawner: Spawner) {
                 7 + current_sf_index,
                 7 + ping.next_sf_index
             );
-            //current_sf_index = ping.next_sf_index;
+            current_sf_index = ping.next_sf_index;
         }
     }
 }
-
