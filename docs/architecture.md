@@ -1,41 +1,59 @@
 # Architecture
 
 End-to-end view of the LoRa-DX-LR30 range-test rig. Two embedded firmware
-images on identical hardware, one Flutter app that runs in two distinct UIs
+images on identical hardware, one Flutter app that runs in three distinct UIs
 depending on the host OS, all glued together by a simple text protocol over
-LoRa on one side and a CSV-on-disk handoff on the other.
+LoRa on one side and either a live USB-host stream or a CSV-on-disk handoff
+on the other.
 
 ## System overview
 
+The walking end has two options: **(A) Android phone hosts node_a over
+USB-C/OTG** and renders the map live, or **(B) iPhone records GPS only**, the
+mac captures node_b's USB log, and the two CSVs are merged offline.
+
 ```
-                ┌───────────────────────┐
-walking node →  │ node_a (PING initiator)│
-                │ SX1262 + STM32F103C8T6 │
-                └──────────┬─────────────┘
-                           │
-                           │  LoRa 433 МГц, BW=125, CR=4/5
-                           │  +22 dBm, 12-byte packet, CRC16-on
-                           │  ─────────── air gap ───────────
-                           │
-                ┌──────────▼─────────────┐
-base node →    │ node_b (PONG responder)│
-                │ SX1262 + STM32F103C8T6 │
-                └──────────┬─────────────┘
-                           │ USART1 PA9 (TX) @ 115200 8N1
-                           ▼
-                ┌───────────────────────┐
-                │ on-board CH340 USB-UART│
-                └──────────┬─────────────┘
-                           │ USB-C  (/dev/cu.usbserial-N on macOS)
-                           ▼
-                ┌───────────────────────┐
-                │ companion (Flutter)    │   ┌─────────────────┐
-                │ macOS — usb_capture    │   │ iPhone (Flutter)│
-                │   → lora_*.csv         │   │ gps_recorder    │
-                │ macOS — map_screen     ├──←│ → gps_*.csv     │
-                │   merge by timestamp   │   │ via AirDrop     │
-                │   → OSM + RSSI dots    │   └─────────────────┘
-                └───────────────────────┘
+                       ┌────────────────────────┐
+       walking node → │ node_a (PING initiator)│
+                       │ SX1262 + STM32F103C8T6 │
+                       └──────────┬─────────────┘
+                                  │
+                                  │  LoRa 433 МГц, BW=125, CR=4/5
+                                  │  +22 dBm, 12-byte packet, CRC16-on
+                                  │  ──────── air gap ────────
+                                  │
+                                  ▼
+                       ┌────────────────────────┐
+        base node →   │ node_b (PONG responder)│
+                       │ SX1262 + STM32F103C8T6 │
+                       └──────────┬─────────────┘
+                                  │ USART1 PA9 (TX) @ 115200 8N1
+                                  │  via on-board CH340 USB-UART
+                                  ▼
+                       ┌────────────────────────┐
+                       │ USB-C  (CH340 bridge)  │
+                       └──────────┬─────────────┘
+                                  │ /dev/cu.usbserial-N
+                                  ▼
+                       ┌────────────────────────┐    ┌─────────────────┐
+                       │ companion — macOS      │    │ iPhone (Flutter)│
+                       │ usb_capture_screen     │    │ gps_recorder    │
+                       │   → lora_*.csv         │←──│ → gps_*.csv     │
+                       │ map_screen             │ Air│ Drop            │
+                       │   merge by timestamp   │   └─────────────────┘
+                       │   → OSM + RSSI dots    │
+                       └────────────────────────┘
+       —— offline flow ↑ ——————————————————————————————————————————
+       —— live flow ↓ ——————————————————————————————————————————————
+
+       node_a ── USB-C ──→ ┌────────────────────────────────┐
+       (PING initiator)    │ Android phone (Flutter)        │
+                           │ live_map_screen                │
+                           │  • usb_serial host (CH340)     │
+                           │  • phone GPS geotags each hit  │
+                           │  • OSM tiles + RSSI dots, live │
+                           │  • merged.csv export via Share │
+                           └────────────────────────────────┘
 ```
 
 Two physical USB cables involved during a session:
@@ -344,20 +362,32 @@ executor, so the IWDG would have no work to do.
 
 ```
 companion/lib/
-├── main.dart                       // Platform.isIOS → GPS recorder, else macOS hub
+├── main.dart                       // Platform.isAndroid → live map,
+│                                   //   else isIOS → GPS recorder, else macOS hub
 ├── models/
 │   ├── lora_event.dart             // parser (node_a + node_b log line shapes)
-│   ├── gps_fix.dart                // Core Location sample
+│   ├── gps_fix.dart                // Core Location / fused-provider sample
 │   └── merged_point.dart           // nearest-timestamp join (binary search)
 ├── services/
-│   ├── serial_service.dart         // flutter_libserialport wrapper, line buffer
+│   ├── serial_service.dart         // macOS: flutter_libserialport wrapper
+│   ├── android_serial_service.dart // Android: usb_serial wrapper (USB Host API)
 │   └── location_service.dart       // geolocator stream + permission gate
+├── widgets/
+│   └── rssi_dot.dart               // shared RSSI→colour dot
 └── screens/
     ├── gps_recorder_screen.dart    // iOS: Start/Stop + Share→AirDrop
     ├── macos_home_screen.dart      // two-card hub
-    ├── usb_capture_screen.dart     // port picker, live list, save CSV
-    └── map_screen.dart             // flutter_map + OSM + RSSI-coloured dots
+    ├── usb_capture_screen.dart     // macOS: port picker, live list, save CSV
+    ├── map_screen.dart             // macOS: flutter_map + OSM + RSSI-coloured dots
+    └── live_map_screen.dart        // Android: USB connect + live GPS-tagged hits
 ```
+
+`flutter_libserialport` has no Android backend — Android USB serial has to go
+through the USB Host API, so the Android target gets its own
+`android_serial_service.dart` built on `usb_serial`, whose bundled
+usb-serial-for-android claims the board's CH340 automatically. The two
+services expose the same `Stream<LoRaEvent>` contract so the rest of the app
+doesn't care which one is wired in.
 
 ### Data flow
 
@@ -435,6 +465,37 @@ of the walk, i.e. clean distance-vs-RSSI falloff.
 > Always cross-check `lora_*.csv`'s last hit timestamp against `gps_*.csv`'s last
 > fix before reading range off the map.
 
+### Live map screen (`live_map_screen.dart`, Android)
+
+The Android target collapses the two-device offline flow into one device: the
+phone hosts **node_a** itself over USB-C/OTG, the phone's own GPS supplies
+position, and each hit is plotted on the map as it arrives. No CSV
+round-trip, no clock-sync between two devices, no AirDrop.
+
+- **Connect** opens the selected USB device with `AndroidSerialService`
+  (115200 8N1, DTR on, no flow control — same framing as the macOS service).
+  USB permission is requested by Android on the first open. Location is
+  started in parallel via `LocationService` so the first hit has a fix
+  waiting.
+- A hit without a fix is **dropped silently** — there's no reasonable
+  fallback position, and the merge tolerance the offline flow uses
+  (`MergedPoint.deltaMs`) collapses to "fix timestamp − hit timestamp" with
+  the latest known fix, typically sub-second.
+- The breadcrumb track is a blue-grey polyline over OSM tiles; matched hits
+  are RSSI-coloured dots (same `RssiDot` widget as the offline screen); a
+  primary-coloured "me" marker sits at the latest fix.
+- A small recenter FAB toggles **follow** mode — the camera tracks the
+  current fix until the user manually pans, then pauses follow until the FAB
+  is tapped again.
+- **CSV** in the bottom bar exports the in-memory `MergedPoint` list
+  straight to a `share_plus` sheet (`SharePlus.instance.share`), bypassing
+  the offline merge step entirely — the points are already merged.
+
+The `USB_DEVICE_ATTACHED` intent-filter + `res/xml/device_filter.xml`
+(CH340 `0x1A86:7523`, CH9102 `0x1A86:55D4`) make Android offer to launch the
+app when node_a is plugged in, so the field workflow is just *plug in → tap
+Connect*.
+
 ### Parser shapes
 
 The serial stream from `node_b` is a mix of free-form log lines plus a few
@@ -455,6 +516,7 @@ Only `hit` events are matched against GPS fixes in the merge step.
 |----------|---------------------------------------------------------------------------------------|
 | iOS      | `NSLocationWhenInUseUsageDescription` + always usage + `UIBackgroundModes=location`   |
 | macOS    | App sandbox **disabled** — character-device opens on `/dev/cu.*` are blocked by sandbox even with the deprecated `temporary-exception.files.absolute-path.read-write` exception. Network client kept on for OSM tile fetching. |
+| Android  | `INTERNET` (OSM tiles), `ACCESS_FINE_LOCATION` + `ACCESS_COARSE_LOCATION` (geotag each hit), `<uses-feature android:name="android.hardware.usb.host" required="true"/>`. USB permission is requested per-attachment by the OS dialog. `USB_DEVICE_ATTACHED` intent-filter + `res/xml/device_filter.xml` make the app launch when the CH340/CH9102 enumerates. |
 
 ## Hardware quirks worth knowing
 
