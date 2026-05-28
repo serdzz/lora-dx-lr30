@@ -3,6 +3,7 @@ import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 
 import 'screens/gps_recorder_screen.dart';
+import 'screens/live_map_screen.dart';
 import 'screens/macos_home_screen.dart';
 
 void main() {
@@ -24,9 +25,11 @@ class LoRaCompanionApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
-      home: Platform.isIOS
-          ? const GpsRecorderScreen()
-          : const MacosHomeScreen(),
+      home: Platform.isAndroid
+          ? const LiveMapScreen()
+          : Platform.isIOS
+              ? const GpsRecorderScreen()
+              : const MacosHomeScreen(),
     );
   }
 }

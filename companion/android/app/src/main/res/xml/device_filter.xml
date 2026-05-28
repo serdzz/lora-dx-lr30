@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB-serial bridges the DX-SMART board may enumerate as. Vendor 0x1A86
+     (6790) is WCH; 0x7523 (29987) is the CH340, 0x55D4 (21972) the CH9102.
+     Values must be decimal. -->
+<resources>
+    <usb-device vendor-id="6790" product-id="29987" />
+    <usb-device vendor-id="6790" product-id="21972" />
+</resources>
