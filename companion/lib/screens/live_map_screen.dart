@@ -7,13 +7,13 @@ import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/gps_fix.dart';
 import '../models/lora_event.dart';
 import '../models/merged_point.dart';
 import '../services/android_serial_service.dart';
 import '../services/location_service.dart';
+import '../services/screen_lock.dart';
 import '../widgets/rssi_dot.dart';
 
 /// Live range-test screen for Android: node_a is plugged into the phone's
@@ -63,7 +63,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     _location.dispose();
     // Release the wakelock if the screen is torn down mid-capture (e.g. the
     // user backed out without tapping Stop). Fire-and-forget — dispose is sync.
-    WakelockPlus.disable().ignore();
+    ScreenLock.disable().ignore();
     super.dispose();
   }
 
@@ -101,10 +101,10 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       _evSub = _serial.events.listen(_onEvent, onError: _onStreamError);
 
       // Keep the screen lit during a range walk — once you're 200 m from the
-      // node and the phone dims, the map is useless. Best-effort: a wakelock
-      // failure (e.g. on an unsupported OEM) must not block capture.
+      // node and the phone dims, the map is useless. Best-effort: a failure
+      // (e.g. native channel not registered yet) must not block capture.
       try {
-        await WakelockPlus.enable();
+        await ScreenLock.enable();
       } catch (_) {}
 
       setState(() => _connected = true);
@@ -123,7 +123,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     await _serial.close();
     await _location.stop();
     try {
-      await WakelockPlus.disable();
+      await ScreenLock.disable();
     } catch (_) {}
     if (!mounted) return;
     setState(() => _connected = false);
