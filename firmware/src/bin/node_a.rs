@@ -108,11 +108,14 @@ async fn main(spawner: Spawner) {
     };
 
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
-    // Garage deployment: pinned to SF10 (index 3) for extra range margin
-    // instead of sweeping SF7..SF12. See docs/speed-vs-range.md — SF7 only
-    // gives 0.5-1.5km in dense-city/metal environments, SF10 gives 2-5km
-    // with enough margin for garage walls/doors.
-    let sf_index: u8 = 3;
+    // Garage deployment: pinned to SF12 (index 5) — max sensitivity/range.
+    // See docs/speed-vs-range.md. Confirmed via earlier sweep test that even
+    // SF12 (best available) dropped the link before reaching the garage, so
+    // this alone won't fix range — the real cause is likely a physical
+    // obstruction, antenna fault, or power loss along the walk, not SF
+    // choice. Pinned here anyway to remove SF as a variable for the next
+    // field test and to avoid re-sweeping through weaker SFs first.
+    let sf_index: u8 = 5;
 
     loop {
         let sf = sf_from_index(sf_index);
