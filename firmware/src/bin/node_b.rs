@@ -115,11 +115,12 @@ async fn main(spawner: Spawner) {
     };
 
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
-    // Start at SF7 — node_a begins each sweep at SF7 too. From there we
-    // follow `ping.next_sf_index` through SF8→SF9→…→SF12→SF7 on round
-    // transitions, and fall back to round-robin scanning on rx-timeout
-    // (see the `Err(_elapsed)` arm below) if the handoff window is lost.
-    let mut current_sf_index: u8 = 0;
+    // Garage deployment: node_a is now pinned to SF10 (index 3), so start
+    // the scan there too — cold-start sync is immediate instead of a 5s/SF
+    // walk through SF7..SF9 first. The follow-SF logic below (on
+    // `ping.next_sf_index`) is a no-op once synced since node_a always
+    // advertises next_sf_index == sf_index == 3.
+    let mut current_sf_index: u8 = 3;
 
     // Fast-scan on cold-start: scan the SF table at 5 s/SF (full table in
     // 30 s) until the first packet is received, then switch to 60 s dwell.

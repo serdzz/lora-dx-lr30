@@ -108,8 +108,11 @@ async fn main(spawner: Spawner) {
     };
 
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
-    // Sweep mode: SF7 → SF8 → … → SF12 → SF7. Indexes 0..5 of SF_TABLE.
-    let mut sf_index: u8 = 0;
+    // Garage deployment: pinned to SF10 (index 3) for extra range margin
+    // instead of sweeping SF7..SF12. See docs/speed-vs-range.md — SF7 only
+    // gives 0.5-1.5km in dense-city/metal environments, SF10 gives 2-5km
+    // with enough margin for garage walls/doors.
+    let sf_index: u8 = 3;
 
     loop {
         let sf = sf_from_index(sf_index);
@@ -283,8 +286,7 @@ async fn main(spawner: Spawner) {
             );
         }
 
-        // Advance to the next SF in the table; wraps SF12 → SF7.
-        sf_index = (sf_index + 1) % (SF_TABLE.len() as u8);
+        // Garage deployment: stay pinned on sf_index (SF10) — no sweep advance.
         Timer::after_millis(500).await;
     }
 }
