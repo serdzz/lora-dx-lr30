@@ -68,6 +68,15 @@ pub struct Packet {
     pub seq: u16,
     pub echo_rssi: i16,
     pub echo_snr: i8,
+    /// Sender's supply voltage, millivolts. `0` means "not measured" (the
+    /// field is unused/zero on node_a's PING and on any older firmware that
+    /// predates this field — `decode()` on a buffer shorter than
+    /// `PACKET_LEN` already rejects it, but a same-length older encoder
+    /// just leaves bytes 10-11 zeroed, which decodes as 0 mV here, not as
+    /// garbage). Repeaters set this on their PONG/forwarded traffic so a
+    /// base station can log remote power-bank health without a separate
+    /// telemetry packet — see `battery.rs`.
+    pub battery_mv: u16,
 }
 
 impl Packet {
@@ -81,6 +90,7 @@ impl Packet {
         b[6..8].copy_from_slice(&self.echo_rssi.to_le_bytes());
         b[8] = self.echo_snr as u8;
         b[9] = self.next_sf_index;
+        b[10..12].copy_from_slice(&self.battery_mv.to_le_bytes());
         b
     }
 
@@ -98,6 +108,7 @@ impl Packet {
             echo_rssi: i16::from_le_bytes([buf[6], buf[7]]),
             echo_snr: buf[8] as i8,
             next_sf_index: buf[9],
+            battery_mv: u16::from_le_bytes([buf[10], buf[11]]),
         })
     }
 }

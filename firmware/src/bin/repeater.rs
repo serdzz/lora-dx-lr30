@@ -62,6 +62,7 @@ use lora_phy::mod_params::RadioError;
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx126x};
 use lora_phy::{LoRa, RxMode};
 
+use lora_dx_lr30::battery::BatteryMonitor;
 use lora_dx_lr30::device_id::{BROADCAST, DEVICE_ID};
 use lora_dx_lr30::host_log;
 use lora_dx_lr30::ota;
@@ -139,6 +140,16 @@ async fn main(spawner: Spawner) {
         led.set_high();
         Timer::after(Duration::from_millis(80)).await;
     }
+
+    // Battery/supply voltage, sampled on PB0 through an 806k/2M divider —
+    // see battery.rs for the wiring rationale. Repeaters report this on
+    // every ping/pong they forward (protocol::Packet::battery_mv) so a base
+    // station can log remote power-bank health without a separate
+    // telemetry packet.
+    let mut battery = BatteryMonitor::new(p.ADC1, p.PB0);
+    let mut battery_mv: u16 = battery.read_mv().await;
+    info!("battery: {} mV", battery_mv);
+    host_log!("battery: {} mV", battery_mv);
 
     let mut spi_cfg = spi::Config::default();
     spi_cfg.frequency = Hertz(8_000_000);
@@ -275,6 +286,20 @@ async fn main(spawner: Spawner) {
         host_log!("repeating {} seq={} sf={}", kind_str, pkt.seq, 7 + pkt.sf_index);
 
         Timer::after(Duration::from_millis(repeat_delay_ms(pkt.seq))).await;
+
+        // Stamp this repeater's own battery/supply voltage onto PONGs as
+        // they pass through — only PONG, since PING originates at node_a
+        // (hand-held, no battery ADC) and overwriting it there would just
+        // report node_a's non-existent reading instead of this repeater's.
+        // Refresh the cached reading once per forwarded PONG rather than on
+        // a fixed timer: this repeater only has spare cycles between radio
+        // windows, and "stale by one forwarding interval" is plenty fresh
+        // for a slow-discharging power bank.
+        let mut pkt = pkt;
+        if pkt.kind == PingKind::Pong {
+            battery_mv = battery.read_mv().await;
+            pkt.battery_mv = battery_mv;
+        }
 
         let payload = pkt.encode();
         let mut tx_pkt_params =

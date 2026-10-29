@@ -255,6 +255,7 @@ async fn main(spawner: Spawner) {
             seq: ping.seq,
             echo_rssi: status.rssi,
             echo_snr: status.snr as i8,
+            battery_mv: 0, // node_b garage deployment runs off wired power, not a battery
         };
         let payload = pong.encode();
 

@@ -23,6 +23,9 @@ in this repo), so the existing wiring is reused as-is.
 | TXEN    | PA0                      | drives onboard RF antenna switch (TX)|
 | RXEN    | PA1                      | drives onboard RF antenna switch (RX)|
 
+Repeaters additionally need a battery/supply voltage divider to PB0 (see
+"Device addressing & OTA" below for the full wiring + rationale).
+
 The DX-LR30 uses a **software-controlled RF SPDT switch** (RXEN/TXEN), not DIO2 —
 this is why `radio.rs` defines a custom `DxLr30` variant that overrides
 `use_dio2_as_rfswitch()` to `false`, and the IV is fed `rf_switch_rx`/`rf_switch_tx`
@@ -155,4 +158,13 @@ opposed to today's fixed `node_a`/`node_b` pair) — not wired into either
   ```bash
   DEVICE_ID=2 cargo run --release --bin repeater
   ```
+- `battery.rs` — battery/supply voltage via a resistor divider on PB0
+  (ADC1_IN8), same 806 kΩ/2 MΩ ratio as the Feather nRF52832 BLE firmware
+  in the sibling `embassy` repo. Wire `VBAT → 806k → PB0 → 2M → GND`.
+  `repeater.rs` samples it on every forwarded PONG and stamps the result
+  into `protocol::Packet::battery_mv` — so a base station sees each
+  repeater's power-bank health riding on the same ping/pong traffic it's
+  already relaying, with no separate telemetry packet or schedule. `0` in
+  that field means "not measured" (node_a/node_b leave it at 0 — they're
+  hand-held/wired-power and don't carry this divider).
 

@@ -152,6 +152,7 @@ async fn main(spawner: Spawner) {
                 seq,
                 echo_rssi: 0,
                 echo_snr: 0,
+                battery_mv: 0, // node_a is hand-held, no battery ADC wired
             };
             let payload = pkt.encode();
 
