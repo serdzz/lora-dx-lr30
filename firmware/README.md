@@ -117,3 +117,29 @@ soft RF switch via PA0/PA1, BUSY/DIO1 on PA2/PC15.
 ## Out of scope
 
 LoRaWAN, encryption, on-flash logging, dynamic role switching. Pure raw-PHY range test.
+
+## Device addressing & OTA wire protocol (`device_id.rs`, `ota.rs`)
+
+Scaffolding for a future multi-node deployment (a chain of repeaters, as
+opposed to today's fixed `node_a`/`node_b` pair) — not wired into either
+`[[bin]]` yet, but ready to build against.
+
+- `device_id::DEVICE_ID` — each physical board's address, a `u8` baked in at
+  compile time from the `DEVICE_ID` env var (`DEVICE_ID=3 cargo build
+  --release --bin repeater`). Defaults to `0` if unset. `255`
+  (`device_id::BROADCAST`) is reserved and rejected at compile time if you
+  try to assign it to a device.
+- `ota::Packet` — a separate, variable-length packet format (distinct
+  `MAGIC` from `protocol.rs`'s fixed 12-byte ping/pong) for pushing a new
+  firmware image over the same LoRa link: `Announce` (broadcast "I have an
+  update") → `Accept` (a specific device opts in) → `Chunk`/`ChunkAck`
+  (unicast, `CHUNK_DATA_LEN = 32` bytes at a time, resend-by-index on a bad
+  chunk) → `Done`/`DoneAck` (final CRC check before the device commits and
+  reboots). Chunk delivery is **unicast to one `target` device at a time on
+  purpose** — see the module doc comment in `ota.rs` for why broadcasting
+  flash writes to every repeater at once is the wrong failure mode on a
+  shared channel.
+- Pairs with `embassy-boot-stm32`'s swap-bank update scheme (not yet added
+  to this repo): `ota.rs` only defines the wire format and chunking math,
+  not flash writing or the bootloader handoff.
+

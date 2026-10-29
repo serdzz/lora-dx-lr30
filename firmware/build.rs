@@ -12,4 +12,10 @@ fn main() {
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Rebuild when DEVICE_ID changes so `option_env!("DEVICE_ID")` in
+    // device_id.rs actually picks up a new value instead of reusing a
+    // cached build. Cargo doesn't track env vars used only by `option_env!`
+    // on its own.
+    println!("cargo:rerun-if-env-changed=DEVICE_ID");
 }
