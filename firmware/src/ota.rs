@@ -82,8 +82,10 @@ impl Kind {
 }
 
 /// Max encoded size across all variants — callers size their LoRa TX/RX
-/// buffers to this, not to any one variant's `encode()` length.
-pub const MAX_PACKET_LEN: usize = HEADER_LEN + 2 + 2 + CHUNK_DATA_LEN; // Chunk: index+total+data
+/// buffers to this, not to any one variant's `encode()` length. Matches
+/// `Chunk`'s layout exactly: 3 (header) + 1 (target) + 2 (index) + 2
+/// (total) + `CHUNK_DATA_LEN` (data) = 8 + `CHUNK_DATA_LEN`.
+pub const MAX_PACKET_LEN: usize = 8 + CHUNK_DATA_LEN;
 
 const HEADER_LEN: usize = 3; // MAGIC, VERSION, Kind
 

@@ -4,7 +4,7 @@ use lora_phy::sx126x::{DeviceSel, Sx126xVariant};
 pub const BANDWIDTH: Bandwidth = Bandwidth::_125KHz;
 pub const CODING_RATE: CodingRate = CodingRate::_4_5;
 pub const PREAMBLE_LEN: u16 = 8;
-pub const MAX_LORA_PAYLOAD: usize = 32;
+pub const MAX_LORA_PAYLOAD: usize = 40;
 
 /// RX timeout for `RxMode::Single(u16)`. On SX126x this is in 15.625 µs units when
 /// using `set_rx`; lora-phy abstracts it as a symbol-based timeout (RegSymbTimeout).

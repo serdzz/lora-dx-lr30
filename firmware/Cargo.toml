@@ -17,6 +17,10 @@ path = "src/bin/node_a.rs"
 name = "node_b"
 path = "src/bin/node_b.rs"
 
+[[bin]]
+name = "repeater"
+path = "src/bin/repeater.rs"
+
 [dependencies]
 embassy-executor = { version = "0.6", features = [
     "arch-cortex-m",

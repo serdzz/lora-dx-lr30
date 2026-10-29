@@ -142,4 +142,17 @@ opposed to today's fixed `node_a`/`node_b` pair) — not wired into either
 - Pairs with `embassy-boot-stm32`'s swap-bank update scheme (not yet added
   to this repo): `ota.rs` only defines the wire format and chunking math,
   not flash writing or the bootloader handoff.
+- `src/bin/repeater.rs` is the first consumer of both: a standalone
+  `[[bin]]` that passively re-transmits every `protocol::Packet`
+  (ping/pong) it decodes — extending range beyond one hop — while
+  separately answering `ota::Packet` OTA traffic addressed to its own
+  compile-time `DEVICE_ID`. It stages incoming firmware chunks into an
+  upper flash region and does the final CRC check, but **does not yet
+  implement the swap-and-boot handoff** (needs either a hand-rolled
+  bootloader stub or an `embassy-stm32` upgrade past 0.1 — see the
+  "NOT YET IMPLEMENTED" note at the top of `repeater.rs`). Build/flash one
+  the same way as `node_a`/`node_b`, with an address:
+  ```bash
+  DEVICE_ID=2 cargo run --release --bin repeater
+  ```
 
