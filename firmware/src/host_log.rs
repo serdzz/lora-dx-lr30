@@ -173,12 +173,11 @@ pub async fn run_host_log_and_cmd(
                 }
                 let len = (len_byte[0] as usize).min(crate::ota::MAX_PACKET_LEN);
                 let mut frame = heapless::Vec::<u8, { crate::ota::MAX_PACKET_LEN }>::new();
-                // Reconstruct the MAGIC byte we already consumed as the
-                // frame's first content byte — ota::Packet::decode expects
-                // it present.
-                let _ = frame.push(0xA5);
+                // `len` counts only the payload bytes after [0xA5][len]; the
+                // payload itself starts with ota::MAGIC (0x5A), so the UART
+                // framing byte 0xA5 must NOT be pushed into the frame.
                 let mut ok = true;
-                for _ in 0..len.saturating_sub(1).min(crate::ota::MAX_PACKET_LEN - 1) {
+                for _ in 0..len {
                     let mut b = [0u8; 1];
                     if rx.read(&mut b).await.is_err() {
                         ok = false;

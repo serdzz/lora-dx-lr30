@@ -84,18 +84,50 @@ class NodeABridge:
     def __init__(self, port: str, baud: int = 115200):
         self.ser = serial.Serial(port, baud, timeout=0.2)
 
-    def enter_ota_mode(self):
-        self.ser.write(b"OTA\n")
-        time.sleep(0.2)
+    def write_paced(self, data: bytes, gap_s: float = 0.002):
+        """node_a reads its UART RX one byte per DMA transfer, so back-to-back
+        bytes overrun and get dropped — "OTA\\n" sent in one write() was never
+        recognised. Pace bytes so each read is re-armed in time."""
+        for c in data:
+            self.ser.write(bytes([c]))
+            self.ser.flush()
+            time.sleep(gap_s)
+
+    def enter_ota_mode(self, timeout_s: float = 300.0):
+        """node_a only polls for host commands between sweep rounds (20 pings
+        at SF12 can take minutes), so wait for its "OTA bridge mode" log line
+        before sending any frame — otherwise the Announce times out host-side
+        while node_a is still mid-round. Re-sends "OTA" after every round
+        summary in case the previous one was lost on the wire."""
+        self.ser.reset_input_buffer()
+        self.write_paced(b"\nOTA\n")
+        deadline = time.monotonic() + timeout_s
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            b = self.ser.read(1)
+            if not b:
+                continue
+            if b[0] != ord("\n"):
+                buf.extend(b)
+                continue
+            line = bytes(buf).decode(errors="replace").rstrip()
+            buf.clear()
+            if line:
+                print("  [node_a log]", line)
+            if "OTA bridge mode" in line and "exited" not in line:
+                return
+            if "summary" in line:
+                self.write_paced(b"OTA\n")
+        raise TimeoutError("node_a never entered OTA bridge mode")
 
     def exit_ota_mode(self):
-        self.ser.write(b"EXIT\n")
+        self.write_paced(b"EXIT\n")
         time.sleep(0.2)
 
     def send_frame(self, payload: bytes):
         if len(payload) > 255:
             raise ValueError("OTA frame too long for the 1-byte length prefix")
-        self.ser.write(bytes([0xA5, len(payload)]) + payload)
+        self.write_paced(bytes([0xA5, len(payload)]) + payload)
 
     def read_frame(self, timeout_s: float):
         """Reads one `[0xA5][len][data]` frame off the UART, or None on
@@ -119,11 +151,11 @@ class NodeABridge:
                     buf.clear()
                     continue
                 length = length_byte[0]
-                data = self.ser.read(length - 1)  # -1: magic byte already counted in len
-                if len(data) < length - 1:
+                data = self.ser.read(length)  # len counts payload bytes only
+                if len(data) < length:
                     buf.clear()
                     continue
-                return bytes([0xA5]) + data
+                return data
             elif b[0] == ord("\n"):
                 if buf:
                     print("  [node_a log]", bytes(buf).decode(errors="replace").rstrip())
@@ -141,10 +173,9 @@ def push(port: str, target: int, image_path: str, retries: int = 5):
     print(f"Image: {len(image)} bytes, crc32={image_crc:08x}, {total_chunks} chunks")
 
     bridge = NodeABridge(port)
-    bridge.enter_ota_mode()
-    time.sleep(0.5)
-
     try:
+        print("Waiting for node_a to enter OTA bridge mode (finishes current round first) ...")
+        bridge.enter_ota_mode()
         print(f"Announcing to target={target} ...")
         bridge.send_frame(encode_announce(updater=0, image_len=len(image), image_crc=image_crc))
         reply = bridge.read_frame(timeout_s=10.0)
