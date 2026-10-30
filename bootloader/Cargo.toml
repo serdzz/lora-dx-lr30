@@ -1,0 +1,25 @@
+[package]
+name = "lora-dx-lr30-bootloader"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal swap-and-boot stub for OTA firmware updates on the node_b BluePill. See src/main.rs for the scheme and its honest limitations."
+license = "MIT"
+
+[[bin]]
+name = "bootloader"
+path = "src/main.rs"
+
+[dependencies]
+swap-common = { path = "../swap-common" }
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false

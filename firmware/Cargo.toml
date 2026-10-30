@@ -22,6 +22,7 @@ name = "repeater"
 path = "src/bin/repeater.rs"
 
 [dependencies]
+swap-common = { path = "../swap-common" }
 embassy-executor = { version = "0.6", features = [
     "arch-cortex-m",
     "executor-thread",
@@ -55,6 +56,7 @@ panic-probe = { version = "0.3", features = ["print-defmt"] }
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 embassy-futures = "0.1"
+heapless = "0.8"
 
 [profile.release]
 codegen-units = 1

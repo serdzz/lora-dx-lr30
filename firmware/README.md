@@ -145,19 +145,15 @@ opposed to today's fixed `node_a`/`node_b` pair) — not wired into either
 - Pairs with `embassy-boot-stm32`'s swap-bank update scheme (not yet added
   to this repo): `ota.rs` only defines the wire format and chunking math,
   not flash writing or the bootloader handoff.
-- `src/bin/repeater.rs` is the first consumer of both: a standalone
-  `[[bin]]` that passively re-transmits every `protocol::Packet`
-  (ping/pong) it decodes — extending range beyond one hop — while
-  separately answering `ota::Packet` OTA traffic addressed to its own
-  compile-time `DEVICE_ID`. It stages incoming firmware chunks into an
-  upper flash region and does the final CRC check, but **does not yet
-  implement the swap-and-boot handoff** (needs either a hand-rolled
-  bootloader stub or an `embassy-stm32` upgrade past 0.1 — see the
-  "NOT YET IMPLEMENTED" note at the top of `repeater.rs`). Build/flash one
-  the same way as `node_a`/`node_b`, with an address:
-  ```bash
-  DEVICE_ID=2 cargo run --release --bin repeater
-  ```
+- `src/bin/repeater.rs` answers `ota::Packet` OTA traffic addressed to its
+  own compile-time `DEVICE_ID`, staging incoming firmware chunks into an
+  upper flash region with a final CRC check — but **does not implement
+  the swap-and-boot handoff** (its `commit_update()` just logs and resets
+  unchanged; see the "NOT YET IMPLEMENTED" note at the top of that file).
+  For an OTA target that actually swaps and boots new firmware, use
+  `../node_b_app/` instead (below) — repeater.rs stays receive-only/
+  honestly-incomplete on purpose rather than silently gaining a different
+  on-disk layout than what this README documents it as.
 - `battery.rs` — battery/supply voltage via a resistor divider on PB0
   (ADC1_IN8), same 806 kΩ/2 MΩ ratio as the Feather nRF52832 BLE firmware
   in the sibling `embassy` repo. Wire `VBAT → 806k → PB0 → 2M → GND`.
@@ -167,4 +163,66 @@ opposed to today's fixed `node_a`/`node_b` pair) — not wired into either
   already relaying, with no separate telemetry packet or schedule. `0` in
   that field means "not measured" (node_a/node_b leave it at 0 — they're
   hand-held/wired-power and don't carry this divider).
+
+## OTA updates that actually apply: `node_a` → `node_b_app` (`../node_b_app/`, `../bootloader/`)
+
+`node_a` pushes a new firmware image to a `node_b_app` board over LoRa, and
+`node_b_app` really does swap to it and reboot — unlike `repeater.rs`'s
+receive-only OTA above. This needs two more crates (siblings of this one,
+same monorepo):
+
+- `../swap-common/` — flash layout + CRC-32 shared by the two below. No
+  embassy/HAL dependency on purpose (see its doc comment) — the bootloader
+  must never be coupled to whatever embassy version the app firmware
+  happens to pin.
+- `../bootloader/` — a ~3 KB hand-rolled bootloader, flashed ONCE per
+  board at `0x0800_0000`. On every boot it checks the staging region for a
+  pending update, copies it into the active-app region if present (with a
+  CRC re-verify before AND after the copy — see its module doc comment for
+  the crash-during-copy safety argument), then jumps to the active app.
+- `../node_b_app/` — `node_b`'s ping/pong behaviour, linked to run from the
+  active-app region (`0x0800_1000`, not `0x0800_0000` — see its
+  `memory.x`) instead of the whole chip, plus a real OTA receiver (ported
+  from `repeater.rs`'s `handle_ota`, with the STM32F1 "must erase before
+  write" fix repeater.rs was missing) that stages the image and writes a
+  swap header instead of just logging "not implemented."
+
+**This flash layout needs 128 KB of physical flash**, not the 64 KB this
+board is marketed as — see `swap-common/src/layout.rs`'s doc comment for
+why many "C8" BluePill clones actually have it, and why both the
+bootloader and `node_b_app` refuse to touch flash at all if the chip's
+factory size register reports less.
+
+### One-time setup per board
+
+```bash
+cd ../bootloader && cargo run --release           # flash the bootloader ONCE
+cd ../node_b_app  && cargo run --release --bin node_b_app   # flash the app
+```
+After this, `probe-rs run` against `node_b_app` directly (bypassing the
+bootloader) will NOT boot correctly — its vector table lives at
+`0x0800_1000`, and only the bootloader's jump sets `VTOR` there. Reflash
+the bootloader first on a chip that's been erased or came in blank.
+
+### Pushing an update
+
+```bash
+# On node_a's host (same machine/terminal you'd use for `cargo run --bin node_a`'s UART log):
+pip3 install pyserial
+python3 ../tools/ota_push.py /dev/cu.wchusbserial1420 --target 2 \
+    ../node_b_app/target/thumbv7m-none-eabi/release/node_b_app.bin
+```
+(`arm-none-eabi-objcopy -O binary ... node_b_app.bin` first if you need a
+raw `.bin` rather than the ELF — `ota_push.py` just reads `image_len`
+bytes from whatever file you give it, whole-file.) The script puts
+`node_a` into OTA bridge mode over its own UART (sending `OTA\n`), relays
+`Announce`/`Chunk`/`Done` to the target over LoRa, waits for each
+`Accept`/`ChunkAck`/`DoneAck`, retries individual lost chunks, and sends
+`EXIT\n` when done to put `node_a` back into its normal ping/pong sweep.
+`--target` is the receiving board's compile-time `DEVICE_ID` (set when you
+built/flashed its `node_b_app`, e.g. `DEVICE_ID=2 cargo build ...`).
+
+Known gap: the bootloader's own 3 KB never gets updated by this scheme —
+only the ~62 KB active-app region does. A bootloader bug needs physical
+SWD re-flashing, same as the very first flash.
 

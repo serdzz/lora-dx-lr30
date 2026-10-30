@@ -4,6 +4,9 @@
 # Rust (firmware/)
 firmware/target/
 firmware/**/*.rs.bk
+bootloader/target/
+node_b_app/target/
+swap-common/target/
 
 # Claude Code per-project memory database (auto-generated, contains local context)
 **/ruvector.db

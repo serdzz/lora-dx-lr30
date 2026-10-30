@@ -17,6 +17,8 @@ use lora_phy::sx126x::{Config as Sx126xConfig, Sx126x};
 use lora_phy::{LoRa, RxMode};
 
 use lora_dx_lr30::host_log;
+use lora_dx_lr30::host_log::HostCmd;
+use lora_dx_lr30::ota;
 use lora_dx_lr30::protocol::{
     sf_from_index, Kind, Packet, FREQ_HZ, HANDOFF_TAIL, PACKET_LEN, PINGS_PER_SF, SF_TABLE,
     TX_POWER_DBM,
@@ -36,7 +38,9 @@ async fn host_log_task(
     tx_dma: DMA1_CH4,
     rx_dma: DMA1_CH5,
 ) {
-    lora_dx_lr30::host_log::run_host_log(usart, tx, rx, tx_dma, rx_dma).await;
+    // node_a is the one binary that reads host commands back (OTA bridge
+    // mode) — see host_log.rs's module doc comment.
+    lora_dx_lr30::host_log::run_host_log_and_cmd(usart, tx, rx, tx_dma, rx_dma).await;
 }
 
 #[embassy_executor::main]
@@ -118,6 +122,22 @@ async fn main(spawner: Spawner) {
     let sf_index: u8 = 5;
 
     loop {
+        // Drain any pending host command before starting the next sweep
+        // round. "OTA" switches into the bridge loop below (which doesn't
+        // return until the host sends "EXIT" or the LoRa side reports a
+        // terminal OTA outcome) — ping/pong sweeping is paused for the
+        // duration, same radio/antenna, so OTA traffic and range-test
+        // traffic never run concurrently on this one node.
+        if let Ok(HostCmd::Line(line)) = host_log::HOST_CMD.try_receive() {
+            if line.as_slice() == b"OTA" {
+                info!("entering OTA bridge mode (host command)");
+                host_log!("OTA bridge mode — relaying frames to/from LoRa");
+                run_ota_bridge(&mut lora).await;
+                info!("left OTA bridge mode");
+                host_log!("OTA bridge mode exited");
+            }
+        }
+
         let sf = sf_from_index(sf_index);
         let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
             Ok(p) => p,
@@ -292,5 +312,112 @@ async fn main(spawner: Spawner) {
 
         // Garage deployment: stay pinned on sf_index (SF10) — no sweep advance.
         Timer::after_millis(500).await;
+    }
+}
+
+/// OTA bridge: node_a becomes a dumb relay between the host (via UART,
+/// `tools/ota_push.py`) and the LoRa link, while an update is pushed to a
+/// target device (`node_b_app` or `repeater`). node_a's own `DEVICE_ID` is
+/// irrelevant here — it never terminates an OTA exchange itself, it just
+/// transmits whatever `ota::Packet` frame the host sends and relays
+/// whatever OTA reply comes back over the air, so the host-side script
+/// drives the actual state machine (Announce → wait Accept → send Chunks
+/// → wait Done → DoneAck) and can show progress/retry logic in Python
+/// instead of firmware.
+///
+/// Pinned to SF12 (matches the garage deployment's `sf_index` — same
+/// reasoning as the main loop: this bridge runs on the same antenna/link
+/// as the ping/pong sweep, no separate radio).
+///
+/// Exits when the host sends a line `b"EXIT"`.
+async fn run_ota_bridge<RK, DLY>(lora: &mut LoRa<RK, DLY>)
+where
+    RK: lora_phy::mod_traits::RadioKind,
+    DLY: embedded_hal_async::delay::DelayNs,
+{
+    let sf_index: u8 = 5;
+    let sf = sf_from_index(sf_index);
+    let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("OTA bridge: mod params err: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        // Race "a host frame/command arrived" against "a LoRa OTA reply
+        // arrived" — whichever happens first gets handled, so this bridge
+        // never has to guess which side will speak next.
+        let rx_pkt_params = match lora.create_rx_packet_params(
+            PREAMBLE_LEN,
+            false,
+            MAX_LORA_PAYLOAD as u8,
+            true,
+            false,
+            &mod_params,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("OTA bridge: rx pkt params err: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = lora.prepare_for_rx(RxMode::Continuous, &mod_params, &rx_pkt_params).await {
+            warn!("OTA bridge: prepare_for_rx err: {}", e);
+            return;
+        }
+
+        let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
+        let host_fut = host_log::HOST_CMD.receive();
+        let radio_fut = lora.rx(&rx_pkt_params, &mut rx_buf);
+
+        match embassy_futures::select::select(host_fut, radio_fut).await {
+            embassy_futures::select::Either::First(cmd) => match cmd {
+                HostCmd::Line(line) if line.as_slice() == b"EXIT" => {
+                    let _ = lora.enter_standby().await;
+                    return;
+                }
+                HostCmd::OtaFrame(frame) => {
+                    let Some(_pkt) = ota::Packet::decode(&frame) else {
+                        warn!("OTA bridge: host sent undecodable frame, dropping");
+                        continue;
+                    };
+                    let mut tx_pkt_params =
+                        match lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("OTA bridge: tx pkt params err: {}", e);
+                                continue;
+                            }
+                        };
+                    if let Err(e) =
+                        lora.prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, &frame).await
+                    {
+                        warn!("OTA bridge: prepare_for_tx err: {}", e);
+                        continue;
+                    }
+                    if let Err(e) = lora.tx().await {
+                        warn!("OTA bridge: tx err: {}", e);
+                    }
+                }
+                HostCmd::Line(_) => {} // ignore any other text line while bridging
+            },
+            embassy_futures::select::Either::Second(rx_result) => match rx_result {
+                Ok((len, _status)) => {
+                    let buf = &rx_buf[..len as usize];
+                    if buf.first() == Some(&ota::MAGIC) {
+                        host_log::push_ota_frame(buf);
+                    }
+                    // Non-OTA traffic heard while bridging (e.g. another
+                    // node's ping/pong) is silently ignored — this bridge
+                    // only forwards OTA frames to the host.
+                }
+                Err(RadioError::ReceiveTimeout) => {}
+                Err(e) => {
+                    warn!("OTA bridge: rx err: {}", e);
+                }
+            },
+        }
     }
 }

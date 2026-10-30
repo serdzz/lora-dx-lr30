@@ -1,0 +1,10 @@
+[package]
+name = "swap-common"
+version = "0.1.0"
+edition = "2021"
+description = "Flash layout, swap header, and CRC-32 shared by the bootloader and node_b_app — see src/lib.rs. Deliberately dependency-free (no embassy, no HAL) so the bootloader stays tiny and independent of whatever embassy version the application firmware is pinned to."
+license = "MIT"
+
+[lib]
+name = "swap_common"
+path = "src/lib.rs"
