@@ -20,7 +20,7 @@ use lora_dx_lr30::host_log;
 use lora_dx_lr30::host_log::HostCmd;
 use lora_dx_lr30::ota;
 use lora_dx_lr30::protocol::{
-    sf_from_index, Kind, Packet, FREQ_HZ, HANDOFF_TAIL, PACKET_LEN, PINGS_PER_SF, SF_TABLE,
+    sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, PINGS_PER_SF,
     TX_POWER_DBM,
 };
 use lora_dx_lr30::radio::{
@@ -160,11 +160,10 @@ async fn main(spawner: Spawner) {
             // advertise the next SF. node_b switches on the FIRST one it
             // receives, so even if 2 of 3 are lost, sync survives. Earlier
             // pings keep `next_sf_index = sf_index` (no-op for node_b).
-            let next_sf_index = if seq + HANDOFF_TAIL >= PINGS_PER_SF {
-                (sf_index + 1) % (SF_TABLE.len() as u8)
-            } else {
-                sf_index
-            };
+            // Garage deployment pins sf_index, so never advertise a switch:
+            // advertising (sf_index + 1) here sent node_b to SF7 at seq 18
+            // while node_a stayed on SF12, killing the link for good.
+            let next_sf_index = sf_index;
             let pkt = Packet {
                 kind: Kind::Ping,
                 sf_index,
