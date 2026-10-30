@@ -50,27 +50,17 @@
 #![no_std]
 #![no_main]
 
-mod flash;
+use swap_common::flash;
 
 use cortex_m::peripheral::SCB;
 use cortex_m_rt::entry;
 use swap_common::crc32::crc32;
 use swap_common::layout::{
-    SwapHeader, ACTIVE_BASE, ACTIVE_LEN, FLASH_BASE, HEADER_RESERVED, PAGE_SIZE, REQUIRED_FLASH_KB,
+    SwapHeader, ACTIVE_BASE, ACTIVE_LEN, FLASH_BASE, HEADER_RESERVED, PAGE_SIZE, upper_flash_present,
     STAGING_OFFSET,
 };
 
 use panic_halt as _;
-
-/// Reads `real_flash_size_kb`'s register directly here (not via
-/// `swap_common::layout::real_flash_size_kb`, to keep `layout` itself
-/// embassy/HAL-free of even a function signature that implies a specific
-/// read mechanism) — same architectural register, RM0008 §3.4.1 "Flash
-/// size".
-fn real_flash_size_kb() -> u16 {
-    const F_SIZE_REG: *const u16 = 0x1FFF_F7E0 as *const u16;
-    unsafe { core::ptr::read_volatile(F_SIZE_REG) }
-}
 
 fn read_header() -> Option<SwapHeader> {
     let base = (FLASH_BASE + STAGING_OFFSET) as *const u8;
@@ -174,8 +164,10 @@ fn boot_active() -> ! {
 
 #[entry]
 fn main() -> ! {
-    if real_flash_size_kb() < REQUIRED_FLASH_KB {
+    if !upper_flash_present() {
         // This board's silicon doesn't have the flash this scheme needs —
+        // checked by mirroring, not the factory size register, which reads
+        // 64 on our boards despite working upper flash (see layout.rs) —
         // see layout.rs's module doc comment. Refuse to touch flash at
         // all (an update attempted on a true-64K chip would write past
         // physical flash); just boot whatever's at ACTIVE_BASE as-is, so

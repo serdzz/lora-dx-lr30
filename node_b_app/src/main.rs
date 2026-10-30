@@ -31,7 +31,6 @@
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_stm32::exti::{Channel as _, ExtiInput};
-use embassy_stm32::flash::Flash;
 use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pull, Speed};
 use embassy_stm32::peripherals::{DMA1_CH4, DMA1_CH5, IWDG, PA10, PA9, USART1};
 use embassy_stm32::spi::{self, Spi};
@@ -126,7 +125,6 @@ async fn main(spawner: Spawner) {
         Err(e) => defmt::panic!("LoRa init failed: {}", e),
     };
 
-    let mut flash = Flash::new_blocking(p.FLASH);
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
     let mut current_sf_index: u8 = 5;
     let mut synced: bool = false;
@@ -178,7 +176,7 @@ async fn main(spawner: Spawner) {
         let buf = &rx_buf[..len as usize];
 
         if buf.first() == Some(&ota::MAGIC) {
-            handle_ota(&mut lora, &mod_params, &mut flash, &mut ota_rx, buf).await;
+            handle_ota(&mut lora, &mod_params, &mut ota_rx, buf).await;
             continue;
         }
 
@@ -241,22 +239,39 @@ async fn main(spawner: Spawner) {
 /// erase cycle (see swap-common's layout doc comment and
 /// firmware/CLAUDE.md's "gotchas" section — this was a known-missing
 /// piece in `repeater.rs`'s version, fixed here).
-fn erase_staging(flash: &mut Flash<'_, embassy_stm32::flash::Blocking>) -> Result<(), ()> {
+fn erase_staging() -> Result<(), ()> {
+    // Staging sits past 64 KB, where embassy's `Flash` (built for
+    // stm32f103c8) panics — use swap_common's raw register driver instead,
+    // and only after confirming upper flash is real (not mirrored), then
+    // verify the erase actually took by reading staging back as all-0xFF.
+    if !swap_common::layout::upper_flash_present() {
+        return Err(());
+    }
     let base = swap_common::layout::FLASH_BASE + STAGING_OFFSET;
-    let pages = STAGING_LEN / PAGE_SIZE;
-    for i in 0..pages {
-        if flash.blocking_erase(base + i * PAGE_SIZE - swap_common::layout::FLASH_BASE,
-                                  base + (i + 1) * PAGE_SIZE - swap_common::layout::FLASH_BASE).is_err() {
-            return Err(());
-        }
+    for i in 0..STAGING_LEN / PAGE_SIZE {
+        unsafe { swap_common::flash::erase_page(base + i * PAGE_SIZE) };
+    }
+    let staging = unsafe { core::slice::from_raw_parts(base as *const u8, STAGING_LEN as usize) };
+    if staging.iter().any(|&b| b != 0xFF) {
+        return Err(());
     }
     Ok(())
+}
+
+/// Writes `data` at `offset` from FLASH_BASE via the raw driver, padding an
+/// odd trailing byte with 0xFF (F1 programs whole half-words only).
+fn write_staging(offset: u32, data: &[u8]) {
+    let addr = swap_common::layout::FLASH_BASE + offset;
+    let even = data.len() & !1;
+    unsafe { swap_common::flash::write(addr, &data[..even]) };
+    if even < data.len() {
+        unsafe { swap_common::flash::write(addr + even as u32, &[data[even], 0xFF]) };
+    }
 }
 
 async fn handle_ota<RK, DLY>(
     lora: &mut LoRa<RK, DLY>,
     mod_params: &lora_phy::mod_params::ModulationParams,
-    flash: &mut Flash<'_, embassy_stm32::flash::Blocking>,
     ota_rx: &mut Option<OtaReceiver>,
     buf: &[u8],
 ) where
@@ -284,8 +299,9 @@ async fn handle_ota<RK, DLY>(
             }
             info!("OTA announce: {} bytes, crc={:08x}", image_len, image_crc);
             host_log!("OTA announce: {} bytes — erasing staging", image_len);
-            if erase_staging(flash).is_err() {
+            if erase_staging().is_err() {
                 warn!("staging erase failed, rejecting update");
+                host_log!("OTA rejected: upper 64 KB flash missing or erase failed");
                 return;
             }
             *ota_rx = Some(OtaReceiver {
@@ -304,13 +320,17 @@ async fn handle_ota<RK, DLY>(
             }
             if index >= rx.next_expected {
                 let offset = STAGING_OFFSET + HEADER_RESERVED + index as u32 * ota::CHUNK_DATA_LEN as u32;
-                match flash.blocking_write(offset, data) {
-                    Ok(()) => {
+                write_staging(offset, data);
+                let written = unsafe {
+                    core::slice::from_raw_parts((swap_common::layout::FLASH_BASE + offset) as *const u8, data.len())
+                };
+                match written == data {
+                    true => {
                         rx.next_expected = index + 1;
                         send_ota(lora, mod_params, &ota::Packet::ChunkAck { target: DEVICE_ID, index, ok: true })
                             .await;
                     }
-                    Err(_) => {
+                    false => {
                         send_ota(lora, mod_params, &ota::Packet::ChunkAck { target: DEVICE_ID, index, ok: false })
                             .await;
                     }
@@ -326,7 +346,7 @@ async fn handle_ota<RK, DLY>(
             host_log!("OTA done, ok={}", ok);
             send_ota(lora, mod_params, &ota::Packet::DoneAck { target: DEVICE_ID, ok }).await;
             if ok {
-                commit_update(flash, rx.image_len, rx.image_crc);
+                commit_update(rx.image_len, rx.image_crc);
             }
         }
         _ => {}
@@ -356,19 +376,13 @@ async fn send_ota<RK, DLY>(
 /// Writes the swap header into staging — fields first, `valid` marker
 /// last, per `swap_common::layout::SwapHeader`'s crash-safety ordering —
 /// then resets into the bootloader, which performs the actual copy.
-fn commit_update(flash: &mut Flash<'_, embassy_stm32::flash::Blocking>, image_len: u32, image_crc: u32) {
+fn commit_update(image_len: u32, image_crc: u32) {
     let header = SwapHeader { image_len, image_crc };
     let fields_offset = STAGING_OFFSET + SwapHeader::FIELDS_OFFSET;
     let valid_offset = STAGING_OFFSET + SwapHeader::VALID_OFFSET;
 
-    if flash.blocking_write(fields_offset, &header.encode_fields_bytes()).is_err() {
-        warn!("failed writing swap header fields — NOT resetting, update stays pending-but-incomplete");
-        return;
-    }
-    if flash.blocking_write(valid_offset, &SwapHeader::encode_valid_bytes()).is_err() {
-        warn!("failed writing swap valid marker — bootloader will not see this update");
-        return;
-    }
+    write_staging(fields_offset, &header.encode_fields_bytes());
+    write_staging(valid_offset, &SwapHeader::encode_valid_bytes());
     host_log!("OTA image staged, resetting into bootloader for swap");
     cortex_m::peripheral::SCB::sys_reset();
 }

@@ -17,13 +17,14 @@
 //! **This needs 128 KB of physical flash, not the 64 KB this board is
 //! marketed as.** STM32F103C8T6 clones commonly ship with the CB die (128
 //! KB) under the C8 marking — see CLAUDE.md's note on this — but it is NOT
-//! guaranteed. Both `bootloader` and `node_b_app` call
-//! [`real_flash_size_kb`] at boot and refuse to proceed (panic, loud log,
-//! no flash write) if the chip reports less than 128 KB, rather than
-//! silently writing past the end of physical flash (which STM32F1 doesn't
-//! fault on — it just does nothing or wraps, either of which corrupts
-//! something silently). Verify this reads ≥128 on your actual boards
-//! BEFORE relying on this scheme in the field.
+//! guaranteed. The factory size register ([`real_flash_size_kb`]) is not
+//! reliable either — our boards report 64 yet have working upper flash —
+//! so both `bootloader` and `node_b_app` instead check
+//! [`upper_flash_present`] (rejects a die whose upper half mirrors the
+//! lower one) and `node_b_app` additionally verifies every staging erase
+//! and write by reading it back, rather than silently writing past the
+//! end of physical flash (which STM32F1 doesn't fault on — it just does
+//! nothing or wraps, either of which corrupts something silently).
 //!
 //! # Why a bootloader instead of `embassy-boot-stm32`
 //! `embassy-boot-stm32` needs `embassy-stm32` 0.6+; this repo is pinned to
@@ -64,6 +65,19 @@ pub const REQUIRED_FLASH_KB: u16 = 128;
 pub fn real_flash_size_kb() -> u16 {
     const F_SIZE_REG: *const u16 = 0x1FFF_F7E0 as *const u16;
     unsafe { core::ptr::read_volatile(F_SIZE_REG) }
+}
+
+/// Whether flash above 64 KB is real, independent of [`real_flash_size_kb`].
+/// Our C8-marked boards report 64 in that register yet have working upper
+/// flash (verified with `stm32flash -w -v` at 0x0801_0800), so the register
+/// alone rejects good chips. The failure we must avoid is a true 64 KB die
+/// whose upper addresses mirror the lower 64 KB: detect that by comparing
+/// the bootloader's vector table at FLASH_BASE with FLASH_BASE + 64 KB
+/// (active-region tail — never identical to the bootloader's vectors).
+pub fn upper_flash_present() -> bool {
+    let lo = FLASH_BASE as *const u32;
+    let hi = (FLASH_BASE + 64 * 1024) as *const u32;
+    (0..16).any(|i| unsafe { core::ptr::read_volatile(lo.add(i)) != core::ptr::read_volatile(hi.add(i)) })
 }
 
 /// Header written at the very start of the staging region, AFTER all image

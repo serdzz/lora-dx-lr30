@@ -1,7 +1,10 @@
 //! Minimal unsafe STM32F1 internal-flash driver: unlock, page-erase,
 //! half-word write. Hand-rolled register pokes instead of `embassy-stm32`
-//! on purpose — see `main.rs`'s module doc comment for why this
-//! bootloader stays off embassy entirely. Register addresses/bit layout
+//! on purpose: the bootloader stays off embassy entirely (see
+//! `../bootloader/src/main.rs`), and `node_b_app` can't use embassy's
+//! `Flash` for staging either — built for `stm32f103c8` it only knows
+//! 64 KB and panics ("Flash sector not found") on any address past that,
+//! which is exactly where staging lives. Register addresses/bit layout
 //! are architectural for the whole STM32F1 line (RM0008 §3.4 "Flash
 //! memory interface registers"), not board-specific.
 
