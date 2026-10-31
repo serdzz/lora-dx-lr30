@@ -103,14 +103,19 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(80)).await;
     }
 
+    host_log!("checkpoint: before ADC init");
     let mut battery = BatteryMonitor::new(p.ADC1, p.PB0);
+    host_log!("checkpoint: ADC init done, before first read");
     let mut battery_mv: u16 = battery.read_mv().await;
+    host_log!("checkpoint: ADC read done");
     info!("battery: {} mV", battery_mv);
     host_log!("battery: {} mV", battery_mv);
 
+    host_log!("checkpoint: before SPI init");
     let mut spi_cfg = spi::Config::default();
     spi_cfg.frequency = Hertz(8_000_000);
     let spi = Spi::new(p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2, spi_cfg);
+    host_log!("checkpoint: SPI init done");
 
     {
         use embassy_stm32::pac::gpio::vals::{CnfIn, Mode};

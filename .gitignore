@@ -51,3 +51,4 @@ companion/macos/Runner.xcodeproj/project.xcworkspace/xcuserdata/
 *.log
 *.swp
 *~
+repeater_app/*.bin
