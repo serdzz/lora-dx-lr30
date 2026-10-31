@@ -26,6 +26,7 @@ use lora_dx_lr30::protocol::{
 use lora_dx_lr30::radio::{
     DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN, RX_SYMBOL_TIMEOUT,
 };
+use lora_dx_lr30::telemetry;
 
 use defmt_rtt as _;
 use panic_probe as _;
@@ -230,6 +231,21 @@ async fn main(spawner: Spawner) {
 
             match lora.rx(&rx_pkt_params, &mut rx_buf).await {
                 Ok((len, status)) => {
+                    // Telemetry (see telemetry.rs) rides the same channel as
+                    // ping/pong but is a separate, shorter, unaddressed
+                    // broadcast — check for it before the ping/pong length/
+                    // magic checks below so a repeater's battery reading
+                    // heard in this narrow single-shot RX window doesn't
+                    // get logged as a "bad magic" miss.
+                    if (len as usize) >= telemetry::PACKET_LEN
+                        && rx_buf.first() == Some(&telemetry::MAGIC)
+                    {
+                        if let Some(t) = telemetry::Packet::decode(&rx_buf[..len as usize]) {
+                            info!("telemetry: device_id={} battery={} mV", t.device_id, t.battery_mv);
+                            host_log!("telemetry: device_id={} battery={} mV", t.device_id, t.battery_mv);
+                        }
+                        continue;
+                    }
                     if (len as usize) < PACKET_LEN {
                         warn!("short packet len={}", len);
                         continue;

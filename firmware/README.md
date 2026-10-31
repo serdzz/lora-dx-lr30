@@ -157,12 +157,22 @@ opposed to today's fixed `node_a`/`node_b` pair) — not wired into either
 - `battery.rs` — battery/supply voltage via a resistor divider on PB0
   (ADC1_IN8), same 806 kΩ/2 MΩ ratio as the Feather nRF52832 BLE firmware
   in the sibling `embassy` repo. Wire `VBAT → 806k → PB0 → 2M → GND`.
-  `repeater.rs` samples it on every forwarded PONG and stamps the result
-  into `protocol::Packet::battery_mv` — so a base station sees each
-  repeater's power-bank health riding on the same ping/pong traffic it's
-  already relaying, with no separate telemetry packet or schedule. `0` in
-  that field means "not measured" (node_a/node_b leave it at 0 — they're
-  hand-held/wired-power and don't carry this divider).
+  Needs the `ADC1_2` NVIC interrupt enabled (done in `BatteryMonitor::
+  new()`) — without it `read_mv().await` hangs forever on the very first
+  conversion with no watchdog reset (confirmed the hard way in the field:
+  one boot log line, 3 LED blinks, then total silence).
+- `telemetry.rs` — a SEPARATE broadcast packet `{device_id, battery_mv}`
+  (distinct `MAGIC`, 5 bytes), not piggybacked on `protocol::Packet`.
+  Each repeater (`repeater.rs`/`repeater_app`) broadcasts its own reading
+  every `telemetry::BROADCAST_INTERVAL_SECS` (30s) AND forwards other
+  devices' telemetry it hears (deduped by `device_id` within a short
+  window). This exists because stamping `protocol::Packet::battery_mv`
+  on a forwarded PONG — the older scheme — gets OVERWRITTEN by every
+  further repeater down the chain: in `node_b_app -> repeater(id=2) ->
+  repeater(id=1) -> node_a`, node_a only ever saw repeater id=1's
+  battery, id=2's reading never arrived. The standalone broadcast fixes
+  this for any chain length. `node_a` logs every telemetry packet it
+  hears (own or forwarded) as `telemetry: device_id=N battery=X mV`.
 
 ## OTA updates that actually apply: `node_a` → `node_b_app` (`../node_b_app/`, `../bootloader/`)
 

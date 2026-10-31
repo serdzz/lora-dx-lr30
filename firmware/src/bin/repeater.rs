@@ -54,7 +54,7 @@ use embassy_stm32::peripherals::{DMA1_CH4, DMA1_CH5, IWDG, PA10, PA9, USART1};
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
-use embassy_time::{with_timeout, Delay, Duration, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use lora_phy::iv::GenericSx126xInterfaceVariant;
@@ -68,6 +68,7 @@ use lora_dx_lr30::host_log;
 use lora_dx_lr30::ota;
 use lora_dx_lr30::protocol::{Kind as PingKind, Packet as PingPacket, FREQ_HZ, PACKET_LEN, SF_TABLE};
 use lora_dx_lr30::radio::{DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN};
+use lora_dx_lr30::telemetry;
 
 use defmt_rtt as _;
 use panic_probe as _;
@@ -78,6 +79,9 @@ use panic_probe as _;
 /// any reasonable window; this only needs to cover "don't immediately
 /// re-echo the packet I just sent."
 const SEEN_LEN: usize = 8;
+
+/// See repeater_app's `TELEMETRY_DEDUP_WINDOW`.
+const TELEMETRY_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 
 /// Where in flash the incoming OTA image gets staged. Placed well above
 /// this repeater's own ~40-50 KB binary (see `cargo build --release` +
@@ -209,7 +213,38 @@ async fn main(spawner: Spawner) {
 
     let mut ota_rx: Option<OtaReceiver> = None;
 
+    let mut seen_telemetry: [(u8, Instant); SEEN_LEN] = [(0xFF, Instant::from_ticks(0)); SEEN_LEN];
+    let mut seen_telemetry_next = 0usize;
+    let mut next_telemetry_at = Instant::now();
+
     loop {
+        if Instant::now() >= next_telemetry_at {
+            next_telemetry_at = Instant::now() + Duration::from_secs(telemetry::BROADCAST_INTERVAL_SECS);
+            battery_mv = battery.read_mv().await;
+            let sf = lora_dx_lr30::protocol::sf_from_index(current_sf_index);
+            if let Ok(mod_params) = lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
+                let tpkt = telemetry::Packet { device_id: DEVICE_ID, battery_mv };
+                let payload = tpkt.encode();
+                if let Ok(mut tx_pkt_params) =
+                    lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params)
+                {
+                    if lora
+                        .prepare_for_tx(
+                            &mod_params,
+                            &mut tx_pkt_params,
+                            lora_dx_lr30::protocol::TX_POWER_DBM,
+                            &payload,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        let _ = lora.tx().await;
+                        host_log!("telemetry broadcast: device_id={} battery={} mV", DEVICE_ID, battery_mv);
+                    }
+                }
+            }
+        }
+
         let sf = lora_dx_lr30::protocol::sf_from_index(current_sf_index);
         let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
             Ok(p) => p,
@@ -258,6 +293,46 @@ async fn main(spawner: Spawner) {
         // ambiguity), then fall back to ping/pong.
         if buf.first() == Some(&ota::MAGIC) {
             handle_ota(&mut lora, &mod_params, &mut flash, &mut ota_rx, buf).await;
+            continue;
+        }
+
+        // Forward a downstream repeater's telemetry broadcast verbatim —
+        // see telemetry.rs's module doc comment for why PONG-stamping
+        // alone can't carry more than one hop's battery reading.
+        if buf.first() == Some(&telemetry::MAGIC) {
+            if let Some(t) = telemetry::Packet::decode(buf) {
+                if t.device_id != DEVICE_ID {
+                    let already_seen = seen_telemetry
+                        .iter()
+                        .any(|&(id, at)| id == t.device_id && Instant::now() < at + TELEMETRY_DEDUP_WINDOW);
+                    if !already_seen {
+                        seen_telemetry[seen_telemetry_next] = (t.device_id, Instant::now());
+                        seen_telemetry_next = (seen_telemetry_next + 1) % seen_telemetry.len();
+                        Timer::after(Duration::from_millis(repeat_delay_ms(t.battery_mv))).await;
+                        if let Ok(mut tx_pkt_params) =
+                            lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params)
+                        {
+                            if lora
+                                .prepare_for_tx(
+                                    &mod_params,
+                                    &mut tx_pkt_params,
+                                    lora_dx_lr30::protocol::TX_POWER_DBM,
+                                    buf,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                let _ = lora.tx().await;
+                                host_log!(
+                                    "forwarding telemetry: device_id={} battery={} mV",
+                                    t.device_id,
+                                    t.battery_mv
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
 

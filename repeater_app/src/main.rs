@@ -33,7 +33,7 @@ use embassy_stm32::peripherals::{DMA1_CH4, DMA1_CH5, IWDG, PA10, PA9, USART1};
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
-use embassy_time::{with_timeout, Delay, Duration, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use lora_phy::iv::GenericSx126xInterfaceVariant;
@@ -49,6 +49,7 @@ use lora_dx_lr30_range_test::protocol::{
     sf_from_index, Kind as PingKind, Packet as PingPacket, FREQ_HZ, PACKET_LEN, SF_TABLE, TX_POWER_DBM,
 };
 use lora_dx_lr30_range_test::radio::{DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN};
+use lora_dx_lr30_range_test::telemetry;
 use swap_common::layout::{
     SwapHeader, HEADER_RESERVED, PAGE_SIZE, STAGING_LEN, STAGING_OFFSET,
 };
@@ -58,6 +59,13 @@ use panic_probe as _;
 
 /// See repeater.rs's `SEEN_LEN`.
 const SEEN_LEN: usize = 8;
+
+/// How recently this repeater must have forwarded a given telemetry
+/// `device_id` before it suppresses a repeat — shorter than
+/// `telemetry::BROADCAST_INTERVAL_SECS` so a genuinely new reading from
+/// the same device 30s later is never mistaken for a duplicate echo of
+/// the one just forwarded.
+const TELEMETRY_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 
 #[embassy_executor::task]
 async fn host_log_task(usart: USART1, tx: PA9, rx: PA10, tx_dma: DMA1_CH4, rx_dma: DMA1_CH5) {
@@ -143,8 +151,40 @@ async fn main(spawner: Spawner) {
     let mut seen: [(u8, u16); SEEN_LEN] = [(0xFF, 0); SEEN_LEN];
     let mut seen_next = 0usize;
     let mut ota_rx: Option<OtaReceiver> = None;
+    // Dedup for FORWARDED telemetry from other devices (separate from
+    // `seen`, which dedups ping/pong by (kind, seq) — telemetry has no
+    // seq number, so dedup by "have I forwarded this device_id recently"
+    // instead).
+    let mut seen_telemetry: [(u8, Instant); SEEN_LEN] = [(0xFF, Instant::from_ticks(0)); SEEN_LEN];
+    let mut seen_telemetry_next = 0usize;
+    // Own battery telemetry — see telemetry.rs for why this is a separate
+    // broadcast instead of relying on PONG-stamping (which a downstream
+    // repeater on the same chain would overwrite before it reaches node_a).
+    let mut next_telemetry_at = Instant::now();
 
     loop {
+        if Instant::now() >= next_telemetry_at {
+            next_telemetry_at = Instant::now() + Duration::from_secs(telemetry::BROADCAST_INTERVAL_SECS);
+            battery_mv = battery.read_mv().await;
+            let sf = sf_from_index(current_sf_index);
+            if let Ok(mod_params) = lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
+                let tpkt = telemetry::Packet { device_id: DEVICE_ID, battery_mv };
+                let payload = tpkt.encode();
+                if let Ok(mut tx_pkt_params) =
+                    lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params)
+                {
+                    if lora
+                        .prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, &payload)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = lora.tx().await;
+                        host_log!("telemetry broadcast: device_id={} battery={} mV", DEVICE_ID, battery_mv);
+                    }
+                }
+            }
+        }
+
         let sf = sf_from_index(current_sf_index);
         let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
             Ok(p) => p,
@@ -191,6 +231,44 @@ async fn main(spawner: Spawner) {
 
         if buf.first() == Some(&ota::MAGIC) {
             handle_ota(&mut lora, &mod_params, &mut ota_rx, buf).await;
+            continue;
+        }
+
+        // Forward a downstream repeater's telemetry broadcast verbatim —
+        // this repeater's OWN telemetry is sent separately above (its
+        // own DEVICE_ID, read fresh each time), this is relaying SOMEONE
+        // ELSE's reading so it isn't lost in a multi-repeater chain (see
+        // telemetry.rs's module doc comment for why PONG-stamping alone
+        // can't carry more than one hop's reading).
+        if buf.first() == Some(&telemetry::MAGIC) {
+            if let Some(t) = telemetry::Packet::decode(buf) {
+                if t.device_id != DEVICE_ID {
+                    let already_seen = seen_telemetry
+                        .iter()
+                        .any(|&(id, at)| id == t.device_id && Instant::now() < at + TELEMETRY_DEDUP_WINDOW);
+                    if !already_seen {
+                        seen_telemetry[seen_telemetry_next] = (t.device_id, Instant::now());
+                        seen_telemetry_next = (seen_telemetry_next + 1) % seen_telemetry.len();
+                        Timer::after(Duration::from_millis(repeat_delay_ms(t.battery_mv))).await;
+                        if let Ok(mut tx_pkt_params) =
+                            lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params)
+                        {
+                            if lora
+                                .prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, buf)
+                                .await
+                                .is_ok()
+                            {
+                                let _ = lora.tx().await;
+                                host_log!(
+                                    "forwarding telemetry: device_id={} battery={} mV",
+                                    t.device_id,
+                                    t.battery_mv
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
 
