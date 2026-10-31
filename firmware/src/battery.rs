@@ -16,8 +16,13 @@
 //! in the reading — average several samples if that matters for your use).
 
 use embassy_stm32::adc::{Adc, SampleTime};
+use embassy_stm32::bind_interrupts;
 use embassy_stm32::peripherals::{ADC1, PB0};
 use embassy_time::Delay;
+
+bind_interrupts!(struct Irqs {
+    ADC1_2 => embassy_stm32::adc::InterruptHandler<ADC1>;
+});
 
 /// Divider ratio ×1_000_000 for integer math: `VBAT_mV = adc_mV * DIVIDER_X1M / 1_000_000`.
 /// 2_000_000 / 806_000 = 2.481389... — stored pre-multiplied to keep this a
@@ -43,6 +48,23 @@ impl<'d> BatteryMonitor<'d> {
         // not microseconds; 239.5 cycles (the longest available) at the
         // default ~12 MHz ADC clock is ~20 µs, the safe choice here.
         adc.set_sample_time(SampleTime::Cycles239_5);
+        // `Adc::new()` does NOT enable the ADC1_2 interrupt in the NVIC —
+        // it only sets up the peripheral registers. `read()`'s internal
+        // `poll_fn` waits on a waker that only `InterruptHandler::
+        // on_interrupt()` (bound above via `bind_interrupts!`) ever wakes,
+        // and that handler is only CALLED if this interrupt is actually
+        // unmasked in the NVIC — without this, `read_mv().await` hangs
+        // forever on the very first conversion, with no watchdog reset
+        // (the hang is a `Pending` future, not a blocking spin loop, so
+        // every OTHER task — including the watchdog petter — keeps
+        // running normally while this one never completes). Found the
+        // hard way: field test showed exactly one log line + 3 LED
+        // blinks, then total silence, no reset-loop even after 15s.
+        unsafe {
+            use embassy_stm32::interrupt::typelevel::Interrupt;
+            embassy_stm32::interrupt::typelevel::ADC1_2::unpend();
+            embassy_stm32::interrupt::typelevel::ADC1_2::enable();
+        }
         Self { adc, pin }
     }
 
