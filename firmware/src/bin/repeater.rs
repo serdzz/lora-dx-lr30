@@ -65,6 +65,7 @@ use lora_phy::{LoRa, RxMode};
 use lora_dx_lr30::battery::BatteryMonitor;
 use lora_dx_lr30::device_id::{BROADCAST, DEVICE_ID};
 use lora_dx_lr30::host_log;
+use lora_dx_lr30::io;
 use lora_dx_lr30::ota;
 use lora_dx_lr30::protocol::{Kind as PingKind, Packet as PingPacket, FREQ_HZ, PACKET_LEN, SF_TABLE};
 use lora_dx_lr30::radio::{DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN};
@@ -82,6 +83,24 @@ const SEEN_LEN: usize = 8;
 
 /// See repeater_app's `TELEMETRY_DEDUP_WINDOW`.
 const TELEMETRY_DEDUP_WINDOW: Duration = Duration::from_secs(10);
+
+/// Same role as `SEEN_LEN`'s ring, for `io::Packet` traffic — which has
+/// no `seq` field (see `io.rs` module doc comment), so dedup keys on a
+/// cheap hash of the raw payload bytes instead of (kind, seq).
+const IO_SEEN_LEN: usize = 8;
+
+/// Tiny non-cryptographic hash (FNV-1a) of an io::Packet's raw bytes —
+/// good enough to distinguish "packet I already forwarded" from "a new
+/// one", not meant to resist adversarial collisions on a trusted LoRa
+/// link with a handful of devices.
+fn io_payload_hash(buf: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in buf {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
 
 /// Where in flash the incoming OTA image gets staged. Placed well above
 /// this repeater's own ~40-50 KB binary (see `cargo build --release` +
@@ -211,6 +230,11 @@ async fn main(spawner: Spawner) {
     let mut seen: [(u8, u16); SEEN_LEN] = [(0xFF, 0); SEEN_LEN];
     let mut seen_next = 0usize;
 
+    // Same, for io::Packet (relay/sensor) traffic — see IO_SEEN_LEN doc
+    // comment.
+    let mut io_seen: [u32; IO_SEEN_LEN] = [0; IO_SEEN_LEN];
+    let mut io_seen_next = 0usize;
+
     let mut ota_rx: Option<OtaReceiver> = None;
 
     let mut seen_telemetry: [(u8, Instant); SEEN_LEN] = [(0xFF, Instant::from_ticks(0)); SEEN_LEN];
@@ -290,9 +314,48 @@ async fn main(spawner: Spawner) {
         let buf = &rx_buf[..len as usize];
 
         // Try OTA first (distinct MAGIC from protocol::Packet, so no
-        // ambiguity), then fall back to ping/pong.
+        // ambiguity), then io::Packet (relay/sensor, distinct MAGIC
+        // too), then fall back to ping/pong.
         if buf.first() == Some(&ota::MAGIC) {
             handle_ota(&mut lora, &mod_params, &mut flash, &mut ota_rx, buf).await;
+            continue;
+        }
+        if buf.first() == Some(&io::MAGIC) {
+            // Dumb forward, same shape as ping/pong below: repeat once,
+            // dedup on raw payload bytes (io::Packet has no seq field —
+            // these are low-rate on-demand exchanges, not a continuous
+            // stream, so a content hash is enough to avoid re-echoing).
+            let hash = io_payload_hash(buf);
+            let already_seen = io_seen.iter().any(|&h| h == hash);
+            if already_seen {
+                continue;
+            }
+            io_seen[io_seen_next] = hash;
+            io_seen_next = (io_seen_next + 1) % IO_SEEN_LEN;
+
+            led.toggle();
+            info!("repeating io frame ({} bytes)", buf.len());
+            host_log!("repeating io frame ({} bytes)", buf.len());
+            Timer::after(Duration::from_millis(repeat_delay_ms(hash as u16))).await;
+
+            let mut tx_pkt_params =
+                match lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("io forward: tx pkt params err: {}", e);
+                        continue;
+                    }
+                };
+            if let Err(e) = lora
+                .prepare_for_tx(&mod_params, &mut tx_pkt_params, lora_dx_lr30::protocol::TX_POWER_DBM, buf)
+                .await
+            {
+                warn!("io forward: prepare_for_tx err: {}", e);
+                continue;
+            }
+            if let Err(e) = lora.tx().await {
+                warn!("io forward: tx err: {}", e);
+            }
             continue;
         }
 

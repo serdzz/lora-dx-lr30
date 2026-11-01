@@ -100,6 +100,18 @@ pub fn push_ota_frame(data: &[u8]) {
     let _ = HOST_LOG.try_write(&data[..len as usize]);
 }
 
+/// Same idea as [`push_ota_frame`] but for `io::Packet` relay/sensor
+/// traffic, framed `[0xA6][len][data]` — a distinct leading byte from
+/// the OTA framing's `0xA5` so the host-side parser can tell the two
+/// binary frame families apart on byte 0 alone (`io::MAGIC` is `0x3C`,
+/// unrelated to this UART framing byte — `ota::MAGIC` happening to equal
+/// the OTA framing byte is a coincidence, not a rule this follows).
+pub fn push_io_frame(data: &[u8]) {
+    let len = data.len().min(255) as u8;
+    let _ = HOST_LOG.try_write(&[0xA6, len]);
+    let _ = HOST_LOG.try_write(&data[..len as usize]);
+}
+
 /// A command/frame parsed off the host UART — see the module doc comment's
 /// "Host → device command/OTA channel" section for the wire shapes.
 pub enum HostCmd {
@@ -111,6 +123,10 @@ pub enum HostCmd {
     /// One raw `ota::Packet`-encoded frame, ready to hand straight to
     /// `lora.prepare_for_tx`/`tx()` unmodified.
     OtaFrame(heapless::Vec<u8, { crate::ota::MAX_PACKET_LEN }>),
+    /// One raw `io::Packet`-encoded frame (relay set / sensor query),
+    /// ready to transmit over LoRa unmodified — same "host drives the
+    /// state machine, firmware is a dumb relay" split as `OtaFrame`.
+    IoFrame(heapless::Vec<u8, { crate::io::MAX_PACKET_LEN }>),
 }
 
 /// Queue of parsed host commands for `node_a`'s main loop to drain with
@@ -164,29 +180,52 @@ pub async fn run_host_log_and_cmd(
             }
             let b = byte[0];
 
-            if line.is_empty() && b == 0xA5 {
-                // Binary OTA frame: next byte is length, then that many
-                // payload bytes.
+            if line.is_empty() && (b == 0xA5 || b == 0xA6) {
+                // Binary frame: next byte is length, then that many
+                // payload bytes. 0xA5 = ota::Packet frame, 0xA6 =
+                // io::Packet frame — see HostCmd's doc comment.
+                let is_io_frame = b == 0xA6;
                 let mut len_byte = [0u8; 1];
                 if rx.read(&mut len_byte).await.is_err() {
                     continue;
                 }
-                let len = (len_byte[0] as usize).min(crate::ota::MAX_PACKET_LEN);
-                let mut frame = heapless::Vec::<u8, { crate::ota::MAX_PACKET_LEN }>::new();
-                // `len` counts only the payload bytes after [0xA5][len]; the
-                // payload itself starts with ota::MAGIC (0x5A), so the UART
-                // framing byte 0xA5 must NOT be pushed into the frame.
-                let mut ok = true;
-                for _ in 0..len {
-                    let mut b = [0u8; 1];
-                    if rx.read(&mut b).await.is_err() {
-                        ok = false;
-                        break;
+                let max_len = if is_io_frame {
+                    crate::io::MAX_PACKET_LEN
+                } else {
+                    crate::ota::MAX_PACKET_LEN
+                };
+                let len = (len_byte[0] as usize).min(max_len);
+                if is_io_frame {
+                    let mut frame = heapless::Vec::<u8, { crate::io::MAX_PACKET_LEN }>::new();
+                    let mut ok = true;
+                    for _ in 0..len {
+                        let mut b = [0u8; 1];
+                        if rx.read(&mut b).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                        let _ = frame.push(b[0]);
                     }
-                    let _ = frame.push(b[0]);
-                }
-                if ok {
-                    HOST_CMD.send(HostCmd::OtaFrame(frame)).await;
+                    if ok {
+                        HOST_CMD.send(HostCmd::IoFrame(frame)).await;
+                    }
+                } else {
+                    // `len` counts only the payload bytes after [0xA5][len]; the
+                    // payload itself starts with ota::MAGIC (0x5A), so the UART
+                    // framing byte 0xA5 must NOT be pushed into the frame.
+                    let mut frame = heapless::Vec::<u8, { crate::ota::MAX_PACKET_LEN }>::new();
+                    let mut ok = true;
+                    for _ in 0..len {
+                        let mut b = [0u8; 1];
+                        if rx.read(&mut b).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                        let _ = frame.push(b[0]);
+                    }
+                    if ok {
+                        HOST_CMD.send(HostCmd::OtaFrame(frame)).await;
+                    }
                 }
                 continue;
             }

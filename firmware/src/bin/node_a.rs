@@ -18,6 +18,7 @@ use lora_phy::{LoRa, RxMode};
 
 use lora_dx_lr30::host_log;
 use lora_dx_lr30::host_log::HostCmd;
+use lora_dx_lr30::io;
 use lora_dx_lr30::ota;
 use lora_dx_lr30::protocol::{
     sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, PINGS_PER_SF,
@@ -136,6 +137,12 @@ async fn main(spawner: Spawner) {
                 run_ota_bridge(&mut lora).await;
                 info!("left OTA bridge mode");
                 host_log!("OTA bridge mode exited");
+            } else if line.as_slice() == b"IO" {
+                info!("entering IO bridge mode (host command)");
+                host_log!("IO bridge mode — relaying relay/sensor frames to/from LoRa");
+                run_io_bridge(&mut lora).await;
+                info!("left IO bridge mode");
+                host_log!("IO bridge mode exited");
             }
         }
 
@@ -417,6 +424,7 @@ where
                     }
                 }
                 HostCmd::Line(_) => {} // ignore any other text line while bridging
+                HostCmd::IoFrame(_) => {} // not relevant to OTA bridge mode
             },
             embassy_futures::select::Either::Second(rx_result) => match rx_result {
                 Ok((len, _status)) => {
@@ -431,6 +439,107 @@ where
                 Err(RadioError::ReceiveTimeout) => {}
                 Err(e) => {
                     warn!("OTA bridge: rx err: {}", e);
+                }
+            },
+        }
+    }
+}
+
+/// IO bridge: node_a relays `io::Packet` relay-set/sensor-query frames
+/// between the host (UART, e.g. the MQTT bridge in `tools/`) and the
+/// LoRa link — same "dumb relay, host drives the state machine" split
+/// as [`run_ota_bridge`], just for the smaller relay/sensor protocol
+/// instead of firmware chunks.
+///
+/// Pinned to SF12 (index 5), same reasoning as `run_ota_bridge`: shares
+/// the one antenna/radio with the ping/pong sweep, so this mode and the
+/// sweep never run concurrently.
+///
+/// Exits when the host sends a line `b"EXIT"`.
+async fn run_io_bridge<RK, DLY>(lora: &mut LoRa<RK, DLY>)
+where
+    RK: lora_phy::mod_traits::RadioKind,
+    DLY: embedded_hal_async::delay::DelayNs,
+{
+    let sf_index: u8 = 5;
+    let sf = sf_from_index(sf_index);
+    let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("IO bridge: mod params err: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        let rx_pkt_params = match lora.create_rx_packet_params(
+            PREAMBLE_LEN,
+            false,
+            MAX_LORA_PAYLOAD as u8,
+            true,
+            false,
+            &mod_params,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("IO bridge: rx pkt params err: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = lora.prepare_for_rx(RxMode::Continuous, &mod_params, &rx_pkt_params).await {
+            warn!("IO bridge: prepare_for_rx err: {}", e);
+            return;
+        }
+
+        let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
+        let host_fut = host_log::HOST_CMD.receive();
+        let radio_fut = lora.rx(&rx_pkt_params, &mut rx_buf);
+
+        match embassy_futures::select::select(host_fut, radio_fut).await {
+            embassy_futures::select::Either::First(cmd) => match cmd {
+                HostCmd::Line(line) if line.as_slice() == b"EXIT" => {
+                    let _ = lora.enter_standby().await;
+                    return;
+                }
+                HostCmd::IoFrame(frame) => {
+                    let Some(_pkt) = io::Packet::decode(&frame) else {
+                        warn!("IO bridge: host sent undecodable frame, dropping");
+                        continue;
+                    };
+                    let mut tx_pkt_params =
+                        match lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("IO bridge: tx pkt params err: {}", e);
+                                continue;
+                            }
+                        };
+                    if let Err(e) =
+                        lora.prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, &frame).await
+                    {
+                        warn!("IO bridge: prepare_for_tx err: {}", e);
+                        continue;
+                    }
+                    if let Err(e) = lora.tx().await {
+                        warn!("IO bridge: tx err: {}", e);
+                    }
+                }
+                HostCmd::Line(_) => {} // ignore any other text line while bridging
+                HostCmd::OtaFrame(_) => {} // not relevant to IO bridge mode
+            },
+            embassy_futures::select::Either::Second(rx_result) => match rx_result {
+                Ok((len, _status)) => {
+                    let buf = &rx_buf[..len as usize];
+                    if buf.first() == Some(&io::MAGIC) {
+                        host_log::push_io_frame(buf);
+                    }
+                    // Non-IO traffic heard while bridging (ping/pong,
+                    // OTA) is silently ignored — this bridge only
+                    // forwards io::Packet frames to the host.
+                }
+                Err(RadioError::ReceiveTimeout) => {}
+                Err(e) => {
+                    warn!("IO bridge: rx err: {}", e);
                 }
             },
         }
