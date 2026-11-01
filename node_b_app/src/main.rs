@@ -273,21 +273,47 @@ async fn main(spawner: Spawner) {
 /// erase cycle (see swap-common's layout doc comment and
 /// firmware/CLAUDE.md's "gotchas" section — this was a known-missing
 /// piece in `repeater.rs`'s version, fixed here).
-fn erase_staging() -> Result<(), ()> {
+///
+/// Returns a distinguishing error so the caller's log line can say WHICH
+/// of the two failure modes happened — `upper_flash_present()` false
+/// (silicon genuinely lacks the upper 64 KB, or the mirroring check is
+/// wrong) vs. erase-succeeded-but-readback-failed (real flash fault, or
+/// leftover bytes from an interrupted previous attempt that the erase
+/// somehow didn't clear) — rather than collapsing both into one
+/// ambiguous "erase failed" message.
+enum EraseStagingError {
+    UpperFlashAbsent,
+    ReadbackMismatch { first_bad_offset: u32, bad_count: u32 },
+}
+
+fn erase_staging() -> Result<(), EraseStagingError> {
     // Staging sits past 64 KB, where embassy's `Flash` (built for
     // stm32f103c8) panics — use swap_common's raw register driver instead,
     // and only after confirming upper flash is real (not mirrored), then
     // verify the erase actually took by reading staging back as all-0xFF.
     if !swap_common::layout::upper_flash_present() {
-        return Err(());
+        return Err(EraseStagingError::UpperFlashAbsent);
     }
     let base = swap_common::layout::FLASH_BASE + STAGING_OFFSET;
     for i in 0..STAGING_LEN / PAGE_SIZE {
         unsafe { swap_common::flash::erase_page(base + i * PAGE_SIZE) };
     }
     let staging = unsafe { core::slice::from_raw_parts(base as *const u8, STAGING_LEN as usize) };
-    if staging.iter().any(|&b| b != 0xFF) {
-        return Err(());
+    let mut first_bad_offset: Option<u32> = None;
+    let mut bad_count: u32 = 0;
+    for (i, &b) in staging.iter().enumerate() {
+        if b != 0xFF {
+            bad_count += 1;
+            if first_bad_offset.is_none() {
+                first_bad_offset = Some(i as u32);
+            }
+        }
+    }
+    if bad_count > 0 {
+        return Err(EraseStagingError::ReadbackMismatch {
+            first_bad_offset: first_bad_offset.unwrap_or(0),
+            bad_count,
+        });
     }
     Ok(())
 }
@@ -333,10 +359,25 @@ async fn handle_ota<RK, DLY>(
             }
             info!("OTA announce: {} bytes, crc={:08x}", image_len, image_crc);
             host_log!("OTA announce: {} bytes — erasing staging", image_len);
-            if erase_staging().is_err() {
-                warn!("staging erase failed, rejecting update");
-                host_log!("OTA rejected: upper 64 KB flash missing or erase failed");
-                return;
+            match erase_staging() {
+                Ok(()) => {}
+                Err(EraseStagingError::UpperFlashAbsent) => {
+                    warn!("staging erase rejected: upper_flash_present() == false");
+                    host_log!("OTA rejected: upper_flash_present() reports no upper 64 KB flash");
+                    return;
+                }
+                Err(EraseStagingError::ReadbackMismatch { first_bad_offset, bad_count }) => {
+                    warn!(
+                        "staging erase readback failed: {} bad byte(s), first at offset {}",
+                        bad_count, first_bad_offset
+                    );
+                    host_log!(
+                        "OTA rejected: erase readback mismatch — {} bad byte(s), first at staging+{}",
+                        bad_count,
+                        first_bad_offset
+                    );
+                    return;
+                }
             }
             *ota_rx = Some(OtaReceiver {
                 image_len,
