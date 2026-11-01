@@ -24,6 +24,14 @@
 //! (without the bootloader present) will NOT boot correctly on a fresh
 //! chip — see the README for the one-time bootloader-then-app flash
 //! order.
+//!
+//! # GPIO relay/sensor extension
+//! Also handles `io::Packet` traffic (relay set / sensor query), ported
+//! verbatim from `firmware/src/bin/node_b.rs` — same pins (PB1/PB2
+//! relays, PB5/PB6 sensors), same dispatch pattern. This lets a board
+//! running OTA-updatable firmware still drive physical relays/sensors;
+//! without this port, choosing the OTA-capable binary would have meant
+//! giving up GPIO control, and vice versa.
 
 #![no_std]
 #![no_main]
@@ -45,6 +53,7 @@ use lora_phy::sx126x::{Config as Sx126xConfig, Sx126x};
 use lora_phy::{LoRa, RxMode};
 
 use lora_dx_lr30_range_test::host_log;
+use lora_dx_lr30_range_test::io;
 use lora_dx_lr30_range_test::ota;
 use lora_dx_lr30_range_test::protocol::{
     sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, SF_TABLE, TX_POWER_DBM,
@@ -72,6 +81,15 @@ async fn watchdog_task(iwdg: IWDG) {
     }
 }
 
+/// GPIO assignment for the relay/sensor extension — ported verbatim
+/// from `firmware/src/bin/node_b.rs::io_pins` (see that file's doc
+/// comment for the pin-budget rationale). Same pins, since this binary
+/// shares the same board wiring, just a different flash region.
+mod io_pins {
+    pub const RELAY_COUNT: usize = 2;
+    pub const SENSOR_COUNT: usize = 2;
+}
+
 struct OtaReceiver {
     image_len: u32,
     image_crc: u32,
@@ -95,6 +113,18 @@ async fn main(spawner: Spawner) {
         led.set_high();
         Timer::after(Duration::from_millis(80)).await;
     }
+
+    // Relay outputs / digital sensor inputs — see firmware/src/bin/
+    // node_b.rs for the full wiring rationale (ported verbatim: same
+    // pins, same polarity).
+    let mut relays: [Output<'_, AnyPin>; io_pins::RELAY_COUNT] = [
+        Output::new(p.PB1, Level::Low, Speed::Low).degrade(),
+        Output::new(p.PB2, Level::Low, Speed::Low).degrade(),
+    ];
+    let sensors: [Input<'_, AnyPin>; io_pins::SENSOR_COUNT] = [
+        Input::new(p.PB5, Pull::Up).degrade(),
+        Input::new(p.PB6, Pull::Up).degrade(),
+    ];
 
     let mut spi_cfg = spi::Config::default();
     spi_cfg.frequency = Hertz(8_000_000);
@@ -177,6 +207,10 @@ async fn main(spawner: Spawner) {
 
         if buf.first() == Some(&ota::MAGIC) {
             handle_ota(&mut lora, &mod_params, &mut ota_rx, buf).await;
+            continue;
+        }
+        if buf.first() == Some(&io::MAGIC) {
+            handle_io_packet(&mut lora, &mod_params, &mut relays, &sensors, buf).await;
             continue;
         }
 
@@ -385,4 +419,95 @@ fn commit_update(image_len: u32, image_crc: u32) {
     write_staging(valid_offset, &SwapHeader::encode_valid_bytes());
     host_log!("OTA image staged, resetting into bootloader for swap");
     cortex_m::peripheral::SCB::sys_reset();
+}
+
+/// Handle one decoded `io::Packet` (relay set / sensor query) — ported
+/// verbatim from `firmware/src/bin/node_b.rs::handle_io_packet`. See
+/// that file's doc comment for the DEVICE_ID-filtering rationale (this
+/// binary doesn't filter either, same single-node-pair assumption).
+async fn handle_io_packet<RK, DLY>(
+    lora: &mut LoRa<RK, DLY>,
+    mod_params: &lora_phy::mod_params::ModulationParams,
+    relays: &mut [Output<'_, AnyPin>; io_pins::RELAY_COUNT],
+    sensors: &[Input<'_, AnyPin>; io_pins::SENSOR_COUNT],
+    buf: &[u8],
+) where
+    RK: lora_phy::mod_traits::RadioKind,
+    DLY: embedded_hal_async::delay::DelayNs,
+{
+    let Some(pkt) = io::Packet::decode(buf) else {
+        return;
+    };
+
+    match pkt {
+        io::Packet::SetRelay { target, relay_index, state } => {
+            let idx = relay_index as usize;
+            let ok = idx < relays.len();
+            if ok {
+                if state {
+                    relays[idx].set_high();
+                } else {
+                    relays[idx].set_low();
+                }
+                info!("relay {} set to {}", relay_index, state);
+                host_log!("relay {} set to {}", relay_index, state);
+            } else {
+                warn!("SetRelay: out-of-range relay_index={}", relay_index);
+            }
+            send_io(
+                lora,
+                mod_params,
+                &io::Packet::RelayAck { target, relay_index, state, ok },
+            )
+            .await;
+        }
+        io::Packet::SensorQuery { target } => {
+            let mut mask: u8 = 0;
+            for (i, sensor) in sensors.iter().enumerate() {
+                if sensor.is_high() {
+                    mask |= 1 << i;
+                }
+            }
+            info!("sensor query -> mask={:02x}", mask);
+            host_log!("sensor query -> mask={:02x}", mask);
+            send_io(
+                lora,
+                mod_params,
+                &io::Packet::SensorReport { target, digital_mask: mask },
+            )
+            .await;
+        }
+        io::Packet::RelayAck { .. } | io::Packet::SensorReport { .. } => {}
+    }
+}
+
+/// Encode and transmit one `io::Packet` reply — ported verbatim from
+/// `firmware/src/bin/node_b.rs::send_io`.
+async fn send_io<RK, DLY>(
+    lora: &mut LoRa<RK, DLY>,
+    mod_params: &lora_phy::mod_params::ModulationParams,
+    pkt: &io::Packet,
+) where
+    RK: lora_phy::mod_traits::RadioKind,
+    DLY: embedded_hal_async::delay::DelayNs,
+{
+    let mut buf = [0u8; io::MAX_PACKET_LEN];
+    let n = pkt.encode(&mut buf);
+    let mut tx_pkt_params = match lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, mod_params) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("io reply: tx pkt params err: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = lora
+        .prepare_for_tx(mod_params, &mut tx_pkt_params, TX_POWER_DBM, &buf[..n])
+        .await
+    {
+        warn!("io reply: prepare_for_tx err: {}", e);
+        return;
+    }
+    if let Err(e) = lora.tx().await {
+        warn!("io reply: tx err: {}", e);
+    }
 }
