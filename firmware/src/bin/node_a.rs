@@ -532,10 +532,28 @@ where
                     let buf = &rx_buf[..len as usize];
                     if buf.first() == Some(&io::MAGIC) {
                         host_log::push_io_frame(buf);
+                    } else if (len as usize) >= telemetry::PACKET_LEN
+                        && buf.first() == Some(&telemetry::MAGIC)
+                    {
+                        // Repeaters broadcast battery telemetry on a fixed
+                        // timer (see telemetry.rs), independent of
+                        // ping/pong activity — it keeps arriving even
+                        // while this bridge has paused the sweep, so
+                        // surface it the same way the main loop does
+                        // (text line over host_log!) rather than letting
+                        // it vanish while IO bridge mode is active.
+                        if let Some(t) = telemetry::Packet::decode(buf) {
+                            host_log!(
+                                "telemetry: device_id={} battery={} mV",
+                                t.device_id,
+                                t.battery_mv
+                            );
+                        }
                     }
-                    // Non-IO traffic heard while bridging (ping/pong,
-                    // OTA) is silently ignored — this bridge only
-                    // forwards io::Packet frames to the host.
+                    // Non-IO/telemetry traffic heard while bridging
+                    // (ping/pong, OTA) is silently ignored — this bridge
+                    // only forwards io::Packet frames and telemetry lines
+                    // to the host.
                 }
                 Err(RadioError::ReceiveTimeout) => {}
                 Err(e) => {

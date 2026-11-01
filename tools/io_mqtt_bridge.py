@@ -14,6 +14,11 @@ MQTT topics (node_b -> LoRa -> node_a -> controller):
     lora/node_b/relay/<0|1>/state   "ON"/"OFF"          (retained)
     lora/node_b/sensor/<0|1>/state  "ON"/"OFF"          (retained)
     lora/node_b/io/log              free-form bridge/node_a log lines
+    lora/repeater_<device_id>/battery_mv   millivolts   (retained) —
+        parsed from node_a's "telemetry: device_id=N battery=X mV" log
+        lines (see ../firmware/src/telemetry.rs), works even while the
+        IO bridge is actively controlling relays (node_a.rs's run_io_bridge
+        forwards telemetry it hears to the same log stream this parses).
 
 Usage:
     python3 io_mqtt_bridge.py /dev/cu.wchusbserial1420 \\
@@ -32,6 +37,7 @@ byte:
 """
 
 import argparse
+import re
 import struct
 import sys
 import threading
@@ -58,6 +64,12 @@ KIND_SENSOR_REPORT = 3
 
 RELAY_COUNT = 2
 SENSOR_COUNT = 2
+
+# Matches node_a.rs's `host_log!("telemetry: device_id={} battery={} mV", ...)`
+# line, emitted both in the main sweep loop AND (as of this bridge's
+# node_a.rs patch) inside run_io_bridge's RX arm — so telemetry keeps
+# reaching MQTT even while the IO bridge is active controlling relays.
+TELEMETRY_RE = re.compile(r"telemetry: device_id=(\d+) battery=(\d+) mV")
 
 
 def encode_set_relay(target: int, relay_index: int, state: bool) -> bytes:
@@ -169,6 +181,10 @@ def main():
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] {msg}")
         mqttc.publish("lora/node_b/io/log", f"[{ts}] {msg}", qos=0, retain=False)
+        m = TELEMETRY_RE.search(msg)
+        if m:
+            device_id, battery_mv = int(m.group(1)), int(m.group(2))
+            mqttc.publish(f"lora/repeater_{device_id}/battery_mv", str(battery_mv), qos=0, retain=True)
 
     bridge = NodeABridge(args.port)
     print("Waiting for node_a to enter IO bridge mode (finishes current ping/pong round first) ...")
