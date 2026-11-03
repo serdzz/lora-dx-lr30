@@ -58,7 +58,9 @@ use lora_dx_lr30_range_test::ota;
 use lora_dx_lr30_range_test::protocol::{
     sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, SF_TABLE, TX_POWER_DBM,
 };
-use lora_dx_lr30_range_test::radio::{DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN};
+use lora_dx_lr30_range_test::radio::{
+    duty_cycle_for_sf, DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN,
+};
 use swap_common::layout::{
     SwapHeader, HEADER_RESERVED, PAGE_SIZE, STAGING_LEN, STAGING_OFFSET,
 };
@@ -160,12 +162,26 @@ async fn main(spawner: Spawner) {
     let mut synced: bool = false;
     let mut ota_rx: Option<OtaReceiver> = None;
 
+    // Running counters — surfaced in the periodic status line below so a
+    // host watching only the UART log (no RTT) can see long-run health
+    // (hit rate, time since last ping, loop liveness) without having to
+    // infer it from the per-event lines alone.
+    let mut total_pings: u32 = 0;
+    let mut total_timeouts: u32 = 0;
+    let mut total_rx_errs: u32 = 0;
+    let mut loop_iter: u32 = 0;
+    let mut last_status_at = embassy_time::Instant::now();
+    const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+
     loop {
+        loop_iter = loop_iter.wrapping_add(1);
         let sf = sf_from_index(current_sf_index);
+        info!("loop#{} sf={} synced={}", loop_iter, 7 + current_sf_index, synced);
         let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
             Ok(p) => p,
             Err(e) => {
                 warn!("mod params err: {}", e);
+                host_log!("mod params err (see RTT log for detail)");
                 continue;
             }
         };
@@ -180,57 +196,146 @@ async fn main(spawner: Spawner) {
             Ok(p) => p,
             Err(e) => {
                 warn!("rx pkt params err: {}", e);
+                host_log!("rx pkt params err (see RTT log for detail)");
                 continue;
             }
         };
-        if let Err(e) = lora.prepare_for_rx(RxMode::Continuous, &mod_params, &rx_pkt_params).await {
+        // Power optimisation: once synced on a given SF, try the SX1262's
+        // hardware RX duty-cycle (rx_time/sleep_time, see radio.rs's
+        // `duty_cycle_for_sf` doc comment for the two datasheet
+        // constraints it enforces) instead of burning current in
+        // RxMode::Continuous the whole dwell window. The chip
+        // autonomously sleeps between short listen bursts; no MCU/CPU
+        // sleep involved.
+        //
+        // `duty_cycle_for_sf` returns `None` when the current
+        // `PREAMBLE_LEN` doesn't leave enough slack at this SF to sleep
+        // safely (the bug that broke the field test the first time
+        // around was shipping a window too tight to even latch a
+        // preamble) — fall back to Continuous in that case rather than
+        // risk the link. Also Continuous whenever unsynced (short 5 s
+        // acquisition window — don't risk missing the very first PING
+        // that establishes sync for an unproven power optimisation).
+        let rx_mode = if synced {
+            match duty_cycle_for_sf(sf) {
+                Some(params) => {
+                    info!(
+                        "duty-cycle RX: rx_time={} sleep_time={} (ticks, 15.625us each)",
+                        params.rx_time, params.sleep_time
+                    );
+                    RxMode::DutyCycle(params)
+                }
+                None => {
+                    info!("duty-cycle not viable at SF{} with current PREAMBLE_LEN={} — using Continuous", 7 + current_sf_index, PREAMBLE_LEN);
+                    RxMode::Continuous
+                }
+            }
+        } else {
+            RxMode::Continuous
+        };
+        if let Err(e) = lora.prepare_for_rx(rx_mode, &mod_params, &rx_pkt_params).await {
             warn!("prepare_for_rx err: {}", e);
+            host_log!("prepare_for_rx err (see RTT log for detail)");
             continue;
         }
 
         let dwell = if synced { Duration::from_secs(60) } else { Duration::from_secs(5) };
+        info!("rx window open: dwell={}s sf={}", dwell.as_secs(), 7 + current_sf_index);
         let rx_outcome = with_timeout(dwell, lora.rx(&rx_pkt_params, &mut rx_buf)).await;
+
+        // Periodic health line regardless of what happened this iteration —
+        // keeps showing life signs (and the running hit/timeout/error
+        // tallies) during long quiet stretches, not just on RX events.
+        if last_status_at.elapsed() >= STATUS_INTERVAL {
+            last_status_at = embassy_time::Instant::now();
+            info!(
+                "status: synced={} sf={} pings={} timeouts={} rx_errs={} loop_iter={}",
+                synced, 7 + current_sf_index, total_pings, total_timeouts, total_rx_errs, loop_iter
+            );
+            host_log!(
+                "status: synced={} sf={} pings={} timeouts={} rx_errs={} loop_iter={}",
+                synced, 7 + current_sf_index, total_pings, total_timeouts, total_rx_errs, loop_iter
+            );
+        }
+
         let (len, status) = match rx_outcome {
             Ok(Ok(x)) => x,
-            Ok(Err(RadioError::ReceiveTimeout)) => continue,
+            Ok(Err(RadioError::ReceiveTimeout)) => {
+                total_timeouts = total_timeouts.wrapping_add(1);
+                info!("rx timeout (dwell expired within window) total_timeouts={}", total_timeouts);
+                continue;
+            }
             Ok(Err(e)) => {
-                warn!("rx err: {}", e);
+                total_rx_errs = total_rx_errs.wrapping_add(1);
+                warn!("rx err: {} total_rx_errs={}", e, total_rx_errs);
+                host_log!("rx err total_rx_errs={} (see RTT log for detail)", total_rx_errs);
                 continue;
             }
             Err(_elapsed) => {
-                current_sf_index = (current_sf_index + 1) % (SF_TABLE.len() as u8);
+                total_timeouts = total_timeouts.wrapping_add(1);
+                let next_sf = (current_sf_index + 1) % (SF_TABLE.len() as u8);
+                info!(
+                    "dwell elapsed with no packet: sf {} -> {} total_timeouts={}",
+                    7 + current_sf_index, 7 + next_sf, total_timeouts
+                );
+                host_log!(
+                    "dwell elapsed with no packet: sf {} -> {} total_timeouts={}",
+                    7 + current_sf_index, 7 + next_sf, total_timeouts
+                );
+                current_sf_index = next_sf;
                 let _ = lora.enter_standby().await;
                 continue;
             }
         };
         let buf = &rx_buf[..len as usize];
+        info!("rx frame: len={} rssi={} snr={} first_byte={:02x}", len, status.rssi, status.snr, buf.first());
 
         if buf.first() == Some(&ota::MAGIC) {
+            info!("dispatch: OTA packet, len={}", len);
+            host_log!("dispatch: OTA packet, len={}", len);
             handle_ota(&mut lora, &mod_params, &mut ota_rx, buf).await;
             continue;
         }
         if buf.first() == Some(&io::MAGIC) {
+            info!("dispatch: IO packet, len={}", len);
+            host_log!("dispatch: IO packet, len={}", len);
             handle_io_packet(&mut lora, &mod_params, &mut relays, &sensors, buf).await;
             continue;
         }
 
         if (len as usize) < PACKET_LEN {
+            warn!("short/unknown frame: len={} < PACKET_LEN={} — dropped", len, PACKET_LEN);
+            host_log!("short/unknown frame: len={} < PACKET_LEN={} — dropped", len, PACKET_LEN);
             continue;
         }
         let ping = match Packet::decode(buf) {
             Some(p) => p,
-            None => continue,
+            None => {
+                warn!("bad magic/version in ping/pong-length frame — dropped");
+                host_log!("bad magic/version in ping/pong-length frame — dropped");
+                continue;
+            }
         };
         if ping.kind as u8 != Kind::Ping as u8 {
+            info!("decoded non-Ping packet kind={} — ignored", ping.kind as u8);
             continue;
         }
         if !synced {
             synced = true;
             info!("synced on SF{}", 7 + ping.sf_index);
+            host_log!("synced on SF{}", 7 + ping.sf_index);
         }
 
+        total_pings = total_pings.wrapping_add(1);
         led.toggle();
-        info!("rx ping sf={} seq={} rssi={} snr={}", 7 + ping.sf_index, ping.seq, status.rssi, status.snr);
+        info!(
+            "rx ping sf={} seq={} rssi={} snr={} total_pings={}",
+            7 + ping.sf_index, ping.seq, status.rssi, status.snr, total_pings
+        );
+        host_log!(
+            "rx ping sf={} seq={} rssi={} snr={} total_pings={}",
+            7 + ping.sf_index, ping.seq, status.rssi, status.snr, total_pings
+        );
 
         let pong = Packet {
             kind: Kind::Pong,
@@ -247,22 +352,28 @@ async fn main(spawner: Spawner) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("tx pkt params err: {}", e);
+                    host_log!("tx pkt params err (see RTT log for detail)");
                     continue;
                 }
             };
         if let Err(e) = lora.prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, &payload).await {
             warn!("prepare_for_tx err: {}", e);
+            host_log!("prepare_for_tx err (see RTT log for detail)");
             continue;
         }
         if let Err(e) = lora.tx().await {
             warn!("tx err: {}", e);
+            host_log!("tx err (see RTT log for detail)");
             continue;
         }
+        info!("tx pong seq={} ok", ping.seq);
 
         if (ping.next_sf_index as usize) >= SF_TABLE.len() {
             warn!("ignoring out-of-range next_sf_index={}", ping.next_sf_index);
+            host_log!("ignoring out-of-range next_sf_index={}", ping.next_sf_index);
         } else if ping.next_sf_index != current_sf_index {
             info!("follow SF: {} -> {}", 7 + current_sf_index, 7 + ping.next_sf_index);
+            host_log!("follow SF: {} -> {}", 7 + current_sf_index, 7 + ping.next_sf_index);
             current_sf_index = ping.next_sf_index;
         }
     }

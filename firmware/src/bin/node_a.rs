@@ -302,7 +302,10 @@ async fn main(spawner: Spawner) {
                 }
             }
 
-            Timer::after_millis(50).await;
+            // Pings slowed from 50ms to 1s per Sergej's request — reduces
+            // ping rate ~20x. Round duration grows proportionally
+            // (PINGS_PER_SF=20 pings × ~1s ≈ 20s/round vs. ~1s before).
+            Timer::after_millis(1000).await;
         }
 
         let total = PINGS_PER_SF as i32;
