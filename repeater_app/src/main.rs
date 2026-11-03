@@ -48,7 +48,9 @@ use lora_dx_lr30_range_test::ota;
 use lora_dx_lr30_range_test::protocol::{
     sf_from_index, Kind as PingKind, Packet as PingPacket, FREQ_HZ, PACKET_LEN, SF_TABLE, TX_POWER_DBM,
 };
-use lora_dx_lr30_range_test::radio::{DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN};
+use lora_dx_lr30_range_test::radio::{
+    duty_cycle_for_sf, DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN,
+};
 use lora_dx_lr30_range_test::telemetry;
 use swap_common::layout::{
     SwapHeader, HEADER_RESERVED, PAGE_SIZE, STAGING_LEN, STAGING_OFFSET,
@@ -207,7 +209,20 @@ async fn main(spawner: Spawner) {
                 continue;
             }
         };
-        if let Err(e) = lora.prepare_for_rx(RxMode::Continuous, &mod_params, &rx_pkt_params).await {
+        // Power optimisation: once synced, prefer the SX1262 hardware
+        // RX duty-cycle over Continuous — same logic as node_b_app's
+        // main loop (see radio.rs's `duty_cycle_for_sf` doc comment).
+        // Falls back to Continuous if not viable at this SF or while
+        // unsynced.
+        let rx_mode = if synced {
+            match duty_cycle_for_sf(sf) {
+                Some(params) => RxMode::DutyCycle(params),
+                None => RxMode::Continuous,
+            }
+        } else {
+            RxMode::Continuous
+        };
+        if let Err(e) = lora.prepare_for_rx(rx_mode, &mod_params, &rx_pkt_params).await {
             warn!("prepare_for_rx err: {}", e);
             continue;
         }
