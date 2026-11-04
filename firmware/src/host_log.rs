@@ -32,14 +32,16 @@
 
 use core::fmt::Write;
 
-use embassy_stm32::bind_interrupts;
 use embassy_stm32::peripherals;
 use embassy_stm32::usart::{Config as UartConfig, Uart};
+use embassy_stm32::{bind_interrupts, Peri};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pipe::Pipe;
 
 bind_interrupts!(pub struct Irqs {
     USART1 => embassy_stm32::usart::InterruptHandler<peripherals::USART1>;
+    DMA1_CHANNEL4 => embassy_stm32::dma::InterruptHandler<peripherals::DMA1_CH4>;
+    DMA1_CHANNEL5 => embassy_stm32::dma::InterruptHandler<peripherals::DMA1_CH5>;
 });
 
 pub static HOST_LOG: Pipe<CriticalSectionRawMutex, 1024> = Pipe::new();
@@ -70,15 +72,15 @@ macro_rules! host_log {
 /// `node_b`/`repeater`/`node_b_app`, which only ever write log text to the
 /// host and never read commands back.
 pub async fn run_host_log(
-    usart: peripherals::USART1,
-    tx_pin: peripherals::PA9,
-    rx_pin: peripherals::PA10,
-    tx_dma: peripherals::DMA1_CH4,
-    rx_dma: peripherals::DMA1_CH5,
+    usart: Peri<'static, peripherals::USART1>,
+    tx_pin: Peri<'static, peripherals::PA9>,
+    rx_pin: Peri<'static, peripherals::PA10>,
+    tx_dma: Peri<'static, peripherals::DMA1_CH4>,
+    rx_dma: Peri<'static, peripherals::DMA1_CH5>,
 ) {
     let mut cfg = UartConfig::default();
     cfg.baudrate = 115_200;
-    let uart = Uart::new(usart, rx_pin, tx_pin, Irqs, tx_dma, rx_dma, cfg)
+    let uart = Uart::new(usart, rx_pin, tx_pin, tx_dma, rx_dma, Irqs, cfg)
         .expect("USART1 init");
     let (mut tx, _rx) = uart.split();
 
@@ -146,15 +148,15 @@ pub static HOST_CMD: embassy_sync::channel::Channel<CriticalSectionRawMutex, Hos
 /// (can't be split across two separately-spawned tasks without `'static`
 /// lifetime gymnastics this no_std/no-alloc setup doesn't need).
 pub async fn run_host_log_and_cmd(
-    usart: peripherals::USART1,
-    tx_pin: peripherals::PA9,
-    rx_pin: peripherals::PA10,
-    tx_dma: peripherals::DMA1_CH4,
-    rx_dma: peripherals::DMA1_CH5,
+    usart: Peri<'static, peripherals::USART1>,
+    tx_pin: Peri<'static, peripherals::PA9>,
+    rx_pin: Peri<'static, peripherals::PA10>,
+    tx_dma: Peri<'static, peripherals::DMA1_CH4>,
+    rx_dma: Peri<'static, peripherals::DMA1_CH5>,
 ) {
     let mut cfg = UartConfig::default();
     cfg.baudrate = 115_200;
-    let uart = Uart::new(usart, rx_pin, tx_pin, Irqs, tx_dma, rx_dma, cfg)
+    let uart = Uart::new(usart, rx_pin, tx_pin, tx_dma, rx_dma, Irqs, cfg)
         .expect("USART1 init");
     let (mut tx, mut rx) = uart.split();
 

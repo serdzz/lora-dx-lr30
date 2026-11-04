@@ -27,12 +27,14 @@
 
 use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embassy_stm32::exti::{Channel as _, ExtiInput};
-use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pull, Speed};
+use embassy_stm32::exti::{self, ExtiInput};
+use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::peripherals::{DMA1_CH4, DMA1_CH5, IWDG, PA10, PA9, USART1};
+use embassy_stm32::rcc::LsConfig;
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
+use embassy_stm32::{bind_interrupts, interrupt, Peri};
 use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
@@ -59,6 +61,13 @@ use swap_common::layout::{
 use defmt_rtt as _;
 use panic_probe as _;
 
+bind_interrupts!(struct Irqs {
+    EXTI2 => exti::InterruptHandler<interrupt::typelevel::EXTI2>;
+    EXTI15_10 => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
+    DMA1_CHANNEL2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH2>;
+    DMA1_CHANNEL3 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH3>;
+});
+
 /// See repeater.rs's `SEEN_LEN`.
 const SEEN_LEN: usize = 8;
 
@@ -70,12 +79,18 @@ const SEEN_LEN: usize = 8;
 const TELEMETRY_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 
 #[embassy_executor::task]
-async fn host_log_task(usart: USART1, tx: PA9, rx: PA10, tx_dma: DMA1_CH4, rx_dma: DMA1_CH5) {
+async fn host_log_task(
+    usart: Peri<'static, USART1>,
+    tx: Peri<'static, PA9>,
+    rx: Peri<'static, PA10>,
+    tx_dma: Peri<'static, DMA1_CH4>,
+    rx_dma: Peri<'static, DMA1_CH5>,
+) {
     lora_dx_lr30_range_test::host_log::run_host_log(usart, tx, rx, tx_dma, rx_dma).await;
 }
 
 #[embassy_executor::task]
-async fn watchdog_task(iwdg: IWDG) {
+async fn watchdog_task(iwdg: Peri<'static, IWDG>) {
     let mut wdt = IndependentWatchdog::new(iwdg, 8_000_000);
     wdt.unleash();
     loop {
@@ -96,13 +111,15 @@ fn repeat_delay_ms(seq_like: u16) -> u64 {
     40 + (seq_like % 60) as u64
 }
 
-#[embassy_executor::main]
+#[embassy_executor::main(executor = "embassy_stm32::executor::Executor", entry = "cortex_m_rt::entry")]
 async fn main(spawner: Spawner) {
-    let p = embassy_stm32::init(Default::default());
+    let mut config = embassy_stm32::Config::default();
+    config.rcc.ls = LsConfig::default_lsi();
+    let p = embassy_stm32::init(config);
 
     info!("repeater_app (DEVICE_ID={}, OTA target) — booting, SX1262 @ 433 MHz", DEVICE_ID);
-    spawner.must_spawn(host_log_task(p.USART1, p.PA9, p.PA10, p.DMA1_CH4, p.DMA1_CH5));
-    spawner.must_spawn(watchdog_task(p.IWDG));
+    spawner.spawn(host_log_task(p.USART1, p.PA9, p.PA10, p.DMA1_CH4, p.DMA1_CH5).unwrap());
+    spawner.spawn(watchdog_task(p.IWDG).unwrap());
     host_log!("repeater_app (DEVICE_ID={}) booting", DEVICE_ID);
 
     let mut led = Output::new(p.PB11, Level::High, Speed::Low);
@@ -120,7 +137,7 @@ async fn main(spawner: Spawner) {
 
     let mut spi_cfg = spi::Config::default();
     spi_cfg.frequency = Hertz(8_000_000);
-    let spi = Spi::new(p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2, spi_cfg);
+    let spi = Spi::new(p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2, Irqs, spi_cfg);
 
     {
         use embassy_stm32::pac::gpio::vals::{CnfIn, Mode};
@@ -131,12 +148,11 @@ async fn main(spawner: Spawner) {
     }
 
     let nss = Output::new(p.PA4, Level::High, Speed::VeryHigh);
-    let reset: Output<'_, AnyPin> = Output::new(p.PA3, Level::High, Speed::Low).degrade();
-    let rx_en: Output<'_, AnyPin> = Output::new(p.PA1, Level::Low, Speed::Low).degrade();
-    let tx_en: Output<'_, AnyPin> = Output::new(p.PA0, Level::Low, Speed::Low).degrade();
-    let busy: ExtiInput<'_, AnyPin> = ExtiInput::new(Input::new(p.PA2, Pull::Up).degrade(), p.EXTI2.degrade());
-    let dio1: ExtiInput<'_, AnyPin> =
-        ExtiInput::new(Input::new(p.PC15, Pull::Down).degrade(), p.EXTI15.degrade());
+    let reset = Output::new(p.PA3, Level::High, Speed::Low);
+    let rx_en = Output::new(p.PA1, Level::Low, Speed::Low);
+    let tx_en = Output::new(p.PA0, Level::Low, Speed::Low);
+    let busy = ExtiInput::new(p.PA2, p.EXTI2, Pull::Up, Irqs);
+    let dio1 = ExtiInput::new(p.PC15, p.EXTI15, Pull::Down, Irqs);
 
     let spi_dev = ExclusiveDevice::new(spi, nss, Delay).unwrap();
     let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, Some(rx_en), Some(tx_en)).expect("iv build");

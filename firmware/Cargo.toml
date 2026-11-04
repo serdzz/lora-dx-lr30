@@ -23,26 +23,25 @@ path = "src/bin/repeater.rs"
 
 [dependencies]
 swap-common = { path = "../swap-common" }
-embassy-executor = { version = "0.6", features = [
-    "arch-cortex-m",
-    "executor-thread",
+# serdzz/embassy fork, branch dev/stm32f1-deep-sleep: embassy-stm32 0.6 with
+# STM32F1 STOP-mode (low-power) support. All embassy crates must come from the
+# same source so internal deps (embassy-time-driver etc.) resolve to one version.
+embassy-executor = { git = "https://github.com/serdzz/embassy.git", branch = "dev/stm32f1-deep-sleep", features = [
     "defmt",
-    "integrated-timers",
 ] }
-embassy-stm32 = { version = "0.1", features = [
+embassy-stm32 = { git = "https://github.com/serdzz/embassy.git", branch = "dev/stm32f1-deep-sleep", features = [
     "defmt",
     "stm32f103c8",
-    "memory-x",
     "time-driver-tim2",
     "unstable-pac",
     "exti",
 ] }
-embassy-time = { version = "0.3", features = [
+embassy-time = { git = "https://github.com/serdzz/embassy.git", branch = "dev/stm32f1-deep-sleep", features = [
     "defmt",
     "defmt-timestamp-uptime",
     "tick-hz-32_768",
 ] }
-embassy-sync = "0.6"
+embassy-sync = { git = "https://github.com/serdzz/embassy.git", branch = "dev/stm32f1-deep-sleep" }
 
 embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.2", features = ["async"] }
