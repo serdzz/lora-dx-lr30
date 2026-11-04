@@ -300,7 +300,9 @@ async fn main(spawner: Spawner) {
                                 .await
                                 .is_ok()
                             {
-                                let _ = lora.tx().await;
+                                if with_timeout(Duration::from_secs(5), lora.tx()).await.is_err() {
+                                    warn!("forwarded telemetry tx() TIMED OUT waiting for DIO1");
+                                }
                                 host_log!(
                                     "forwarding telemetry: device_id={} battery={} mV",
                                     t.device_id,
@@ -360,8 +362,8 @@ async fn main(spawner: Spawner) {
             warn!("prepare_for_tx err: {}", e);
             continue;
         }
-        if let Err(e) = lora.tx().await {
-            warn!("tx err: {}", e);
+        if with_timeout(Duration::from_secs(5), lora.tx()).await.is_err() {
+            warn!("repeat tx() TIMED OUT waiting for DIO1");
         }
     }
 }
@@ -524,7 +526,7 @@ async fn send_ota<RK, DLY>(
     if lora.prepare_for_tx(mod_params, &mut tx_pkt_params, TX_POWER_DBM, &buf[..n]).await.is_err() {
         return;
     }
-    let _ = lora.tx().await;
+    let _ = with_timeout(Duration::from_secs(5), lora.tx()).await;
 }
 
 /// Writes the swap header into staging — fields first, `valid` marker
