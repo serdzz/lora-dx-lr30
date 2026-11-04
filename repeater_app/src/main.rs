@@ -182,20 +182,29 @@ async fn main(spawner: Spawner) {
             host_log!("telemetry branch: battery read, building mod params");
             let sf = sf_from_index(current_sf_index);
             if let Ok(mod_params) = lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
+                host_log!("telemetry: mod_params ok");
                 let tpkt = telemetry::Packet { device_id: DEVICE_ID, battery_mv };
                 let payload = tpkt.encode();
                 if let Ok(mut tx_pkt_params) =
                     lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params)
                 {
+                    host_log!("telemetry: tx_pkt_params ok, calling prepare_for_tx");
                     if lora
                         .prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, &payload)
                         .await
                         .is_ok()
                     {
+                        host_log!("telemetry: prepare_for_tx ok, calling tx()");
                         let _ = lora.tx().await;
                         host_log!("telemetry broadcast: device_id={} battery={} mV", DEVICE_ID, battery_mv);
+                    } else {
+                        host_log!("telemetry: prepare_for_tx FAILED");
                     }
+                } else {
+                    host_log!("telemetry: tx_pkt_params FAILED");
                 }
+            } else {
+                host_log!("telemetry: mod_params FAILED");
             }
         }
 
