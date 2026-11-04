@@ -139,14 +139,6 @@ async fn main(spawner: Spawner) {
     spi_cfg.frequency = Hertz(8_000_000);
     let spi = Spi::new(p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2, Irqs, spi_cfg);
 
-    {
-        use embassy_stm32::pac::gpio::vals::{CnfIn, Mode};
-        embassy_stm32::pac::GPIOA.cr(0).modify(|w| {
-            w.set_mode(6, Mode::INPUT);
-            w.set_cnf_in(6, CnfIn::FLOATING);
-        });
-    }
-
     let nss = Output::new(p.PA4, Level::High, Speed::VeryHigh);
     let reset = Output::new(p.PA3, Level::High, Speed::Low);
     let rx_en = Output::new(p.PA1, Level::Low, Speed::Low);
