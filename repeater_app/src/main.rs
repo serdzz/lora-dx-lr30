@@ -177,7 +177,9 @@ async fn main(spawner: Spawner) {
     loop {
         if Instant::now() >= next_telemetry_at {
             next_telemetry_at = Instant::now() + Duration::from_secs(telemetry::BROADCAST_INTERVAL_SECS);
+            host_log!("telemetry branch: reading battery");
             battery_mv = battery.read_mv().await;
+            host_log!("telemetry branch: battery read, building mod params");
             let sf = sf_from_index(current_sf_index);
             if let Ok(mod_params) = lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
                 let tpkt = telemetry::Packet { device_id: DEVICE_ID, battery_mv };
@@ -236,9 +238,11 @@ async fn main(spawner: Spawner) {
             warn!("prepare_for_rx err: {}", e);
             continue;
         }
+        host_log!("prepare_for_rx done, entering rx with_timeout");
 
         let dwell = if synced { Duration::from_secs(60) } else { Duration::from_secs(5) };
         let rx_outcome = with_timeout(dwell, lora.rx(&rx_pkt_params, &mut rx_buf)).await;
+        host_log!("rx with_timeout returned");
         let (len, _status) = match rx_outcome {
             Ok(Ok(x)) => x,
             Ok(Err(RadioError::ReceiveTimeout)) => continue,
