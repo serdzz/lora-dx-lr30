@@ -194,8 +194,12 @@ async fn main(spawner: Spawner) {
                         .await
                         .is_ok()
                     {
-                        host_log!("telemetry: prepare_for_tx ok, calling tx()");
-                        let _ = lora.tx().await;
+                        host_log!("telemetry: prepare_for_tx ok, calling tx() with 5s timeout");
+                        match with_timeout(Duration::from_secs(5), lora.tx()).await {
+                            Ok(Ok(())) => host_log!("telemetry: tx() completed"),
+                            Ok(Err(_e)) => host_log!("telemetry: tx() error (see RTT for detail)"),
+                            Err(_) => host_log!("telemetry: tx() TIMED OUT waiting for DIO1"),
+                        }
                         host_log!("telemetry broadcast: device_id={} battery={} mV", DEVICE_ID, battery_mv);
                     } else {
                         host_log!("telemetry: prepare_for_tx FAILED");
