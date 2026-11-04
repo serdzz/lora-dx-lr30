@@ -150,10 +150,12 @@ async fn main(spawner: Spawner) {
     let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, Some(rx_en), Some(tx_en)).expect("iv build");
 
     let cfg = Sx126xConfig { chip: DxLr30, tcxo_ctrl: None, use_dcdc: true, rx_boost: false };
+    host_log!("LoRa::new starting");
     let mut lora = match LoRa::new(Sx126x::new(spi_dev, iv, cfg), false, Delay).await {
         Ok(r) => r,
         Err(e) => defmt::panic!("LoRa init failed: {}", e),
     };
+    host_log!("LoRa::new done");
 
     let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
     let mut current_sf_index: u8 = 5;
