@@ -8,7 +8,7 @@ use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pull, Speed};
 use embassy_stm32::peripherals::{DMA1_CH4, DMA1_CH5, PA10, PA9, USART1};
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use lora_phy::iv::GenericSx126xInterfaceVariant;
@@ -20,13 +20,8 @@ use lora_dx_lr30::host_log;
 use lora_dx_lr30::host_log::HostCmd;
 use lora_dx_lr30::io;
 use lora_dx_lr30::ota;
-use lora_dx_lr30::protocol::{
-    sf_from_index, Kind, Packet, FREQ_HZ, PACKET_LEN, PINGS_PER_SF,
-    TX_POWER_DBM,
-};
-use lora_dx_lr30::radio::{
-    DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN, RX_SYMBOL_TIMEOUT,
-};
+use lora_dx_lr30::protocol::{sf_from_index, FREQ_HZ, SF_TABLE, TX_POWER_DBM};
+use lora_dx_lr30::radio::{DxLr30, BANDWIDTH, CODING_RATE, MAX_LORA_PAYLOAD, PREAMBLE_LEN};
 use lora_dx_lr30::telemetry;
 
 use defmt_rtt as _;
@@ -113,23 +108,16 @@ async fn main(spawner: Spawner) {
         Err(e) => defmt::panic!("LoRa init failed: {}", e),
     };
 
-    let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
-    // Garage deployment: pinned to SF12 (index 5) — max sensitivity/range.
-    // See docs/speed-vs-range.md. Confirmed via earlier sweep test that even
-    // SF12 (best available) dropped the link before reaching the garage, so
-    // this alone won't fix range — the real cause is likely a physical
-    // obstruction, antenna fault, or power loss along the walk, not SF
-    // choice. Pinned here anyway to remove SF as a variable for the next
-    // field test and to avoid re-sweeping through weaker SFs first.
-    let sf_index: u8 = 5;
-
+    // PING/PONG SF-sweep range test retired (04.11.26) — node_a now always
+    // runs as the MQTT/IO bridge (see run_io_bridge below): it only relays
+    // relay/sensor frames between the host (tools/io_mqtt_bridge.py, over
+    // MQTT) and LoRa, plus surfaces repeater telemetry. `EXIT` from the host
+    // used to drop back to ping-sweep mode; now it just means "the radio had
+    // nothing to do", so we immediately re-enter the bridge instead of
+    // falling through to a dead ping loop. `OTA` still switches to the OTA
+    // bridge on request — that one actually needs to be entered manually,
+    // unlike IO which is now always-on.
     loop {
-        // Drain any pending host command before starting the next sweep
-        // round. "OTA" switches into the bridge loop below (which doesn't
-        // return until the host sends "EXIT" or the LoRa side reports a
-        // terminal OTA outcome) — ping/pong sweeping is paused for the
-        // duration, same radio/antenna, so OTA traffic and range-test
-        // traffic never run concurrently on this one node.
         if let Ok(HostCmd::Line(line)) = host_log::HOST_CMD.try_receive() {
             if line.as_slice() == b"OTA" {
                 info!("entering OTA bridge mode (host command)");
@@ -137,203 +125,15 @@ async fn main(spawner: Spawner) {
                 run_ota_bridge(&mut lora).await;
                 info!("left OTA bridge mode");
                 host_log!("OTA bridge mode exited");
-            } else if line.as_slice() == b"IO" {
-                info!("entering IO bridge mode (host command)");
-                host_log!("IO bridge mode — relaying relay/sensor frames to/from LoRa");
-                run_io_bridge(&mut lora).await;
-                info!("left IO bridge mode");
-                host_log!("IO bridge mode exited");
             }
         }
 
-        let sf = sf_from_index(sf_index);
-        let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("mod params err: {}", e);
-                continue;
-            }
-        };
-
-        let mut hits: u16 = 0;
-        let mut sum_rssi_local: i32 = 0;
-        let mut sum_snr_local: i32 = 0;
-        let mut sum_rssi_remote: i32 = 0;
-        let mut sum_snr_remote: i32 = 0;
-
-        info!("=== SF{} round start ({} pings) ===", 7 + sf_index, PINGS_PER_SF);
-
-        for seq in 0..PINGS_PER_SF {
-            // Robust SF handoff: in the LAST `HANDOFF_TAIL` pings of the round,
-            // advertise the next SF. node_b switches on the FIRST one it
-            // receives, so even if 2 of 3 are lost, sync survives. Earlier
-            // pings keep `next_sf_index = sf_index` (no-op for node_b).
-            // Garage deployment pins sf_index, so never advertise a switch:
-            // advertising (sf_index + 1) here sent node_b to SF7 at seq 18
-            // while node_a stayed on SF12, killing the link for good.
-            let next_sf_index = sf_index;
-            let pkt = Packet {
-                kind: Kind::Ping,
-                sf_index,
-                next_sf_index,
-                seq,
-                echo_rssi: 0,
-                echo_snr: 0,
-                battery_mv: 0, // node_a is hand-held, no battery ADC wired
-            };
-            let payload = pkt.encode();
-
-            let mut tx_pkt_params = match lora.create_tx_packet_params(
-                PREAMBLE_LEN,
-                false,
-                true,
-                false,
-                &mod_params,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("tx pkt params err: {}", e);
-                    continue;
-                }
-            };
-
-            if let Err(e) = lora
-                .prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, &payload)
-                .await
-            {
-                warn!("prepare_for_tx err: {}", e);
-                continue;
-            }
-            if let Err(e) = lora.tx().await {
-                warn!("tx err: {}", e);
-                continue;
-            }
-
-            let rx_pkt_params = match lora.create_rx_packet_params(
-                PREAMBLE_LEN,
-                false,
-                MAX_LORA_PAYLOAD as u8,
-                true,
-                false,
-                &mod_params,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("rx pkt params err: {}", e);
-                    continue;
-                }
-            };
-
-            if let Err(e) = lora
-                .prepare_for_rx(
-                    RxMode::Single(RX_SYMBOL_TIMEOUT),
-                    &mod_params,
-                    &rx_pkt_params,
-                )
-                .await
-            {
-                warn!("prepare_for_rx err: {}", e);
-                continue;
-            }
-
-            match lora.rx(&rx_pkt_params, &mut rx_buf).await {
-                Ok((len, status)) => {
-                    // Telemetry (see telemetry.rs) rides the same channel as
-                    // ping/pong but is a separate, shorter, unaddressed
-                    // broadcast — check for it before the ping/pong length/
-                    // magic checks below so a repeater's battery reading
-                    // heard in this narrow single-shot RX window doesn't
-                    // get logged as a "bad magic" miss.
-                    if (len as usize) >= telemetry::PACKET_LEN
-                        && rx_buf.first() == Some(&telemetry::MAGIC)
-                    {
-                        if let Some(t) = telemetry::Packet::decode(&rx_buf[..len as usize]) {
-                            info!("telemetry: device_id={} battery={} mV", t.device_id, t.battery_mv);
-                            host_log!("telemetry: device_id={} battery={} mV", t.device_id, t.battery_mv);
-                        }
-                        continue;
-                    }
-                    if (len as usize) < PACKET_LEN {
-                        warn!("short packet len={}", len);
-                        continue;
-                    }
-                    let resp = match Packet::decode(&rx_buf[..len as usize]) {
-                        Some(p) => p,
-                        None => {
-                            warn!("bad magic/version");
-                            continue;
-                        }
-                    };
-                    if resp.kind as u8 != Kind::Pong as u8 || resp.seq != seq {
-                        warn!("unexpected resp kind/seq: seq_want={} seq_got={}", seq, resp.seq);
-                        continue;
-                    }
-                    hits += 1;
-                    sum_rssi_local += status.rssi as i32;
-                    sum_snr_local += status.snr as i32;
-                    sum_rssi_remote += resp.echo_rssi as i32;
-                    sum_snr_remote += resp.echo_snr as i32;
-                    led.toggle();
-                    info!(
-                        "sf={} seq={} rx_rssi={} rx_snr={} tx_rssi={} tx_snr={}",
-                        7 + sf_index,
-                        seq,
-                        status.rssi,
-                        status.snr,
-                        resp.echo_rssi,
-                        resp.echo_snr,
-                    );
-                    host_log!(
-                        "sf={} seq={} rx_rssi={} rx_snr={} tx_rssi={} tx_snr={}",
-                        7 + sf_index,
-                        seq,
-                        status.rssi,
-                        status.snr,
-                        resp.echo_rssi,
-                        resp.echo_snr,
-                    );
-                }
-                Err(RadioError::ReceiveTimeout) => {
-                    warn!("miss sf={} seq={}", 7 + sf_index, seq);
-                    host_log!("miss sf={} seq={}", 7 + sf_index, seq);
-                }
-                Err(e) => {
-                    warn!("rx err sf={} seq={}: {}", 7 + sf_index, seq, e);
-                }
-            }
-
-            Timer::after_millis(50).await;
-        }
-
-        let total = PINGS_PER_SF as i32;
-        let per_pct = ((total - hits as i32) * 100) / total;
-        if hits > 0 {
-            let h = hits as i32;
-            info!(
-                "=== SF{} summary: hits={}/{} per={}% rx_rssi_avg={} rx_snr_avg={} tx_rssi_avg={} tx_snr_avg={} ===",
-                7 + sf_index, hits, PINGS_PER_SF, per_pct,
-                sum_rssi_local / h, sum_snr_local / h,
-                sum_rssi_remote / h, sum_snr_remote / h,
-            );
-            host_log!(
-                "=== SF{} summary: hits={}/{} per={}% rx_rssi_avg={} rx_snr_avg={} tx_rssi_avg={} tx_snr_avg={} ===",
-                7 + sf_index, hits, PINGS_PER_SF, per_pct,
-                sum_rssi_local / h, sum_snr_local / h,
-                sum_rssi_remote / h, sum_snr_remote / h,
-            );
-        } else {
-            info!(
-                "=== SF{} summary: hits=0/{} per=100% (no link) ===",
-                7 + sf_index, PINGS_PER_SF
-            );
-            host_log!(
-                "=== SF{} summary: hits=0/{} per=100% (no link) ===",
-                7 + sf_index, PINGS_PER_SF
-            );
-        }
-
-        // Garage deployment: stay pinned on sf_index (SF10) — no sweep advance.
-        Timer::after_millis(500).await;
+        info!("entering IO bridge mode (always-on, no more ping sweep)");
+        host_log!("IO bridge mode — relaying relay/sensor frames to/from LoRa");
+        run_io_bridge(&mut lora).await;
+        info!("IO bridge exited (EXIT or radio error) — re-entering");
+        host_log!("IO bridge mode exited — re-entering");
+        Timer::after_millis(200).await;
     }
 }
 
@@ -357,20 +157,32 @@ where
     RK: lora_phy::mod_traits::RadioKind,
     DLY: embedded_hal_async::delay::DelayNs,
 {
-    let sf_index: u8 = 5;
-    let sf = sf_from_index(sf_index);
-    let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("OTA bridge: mod params err: {}", e);
-            return;
-        }
-    };
+    // Any SF: scan the whole SF_TABLE so OTA works no matter what SF the
+    // far end (repeater/node_b) happens to be on — a single fixed SF (SF12)
+    // meant the OTA bridge would silently never hear an updater running at
+    // a different SF. Each SF gets a short RX dwell; a host OTA frame can
+    // arrive on ANY of them (the host doesn't know/care which SF is "the"
+    // SF — it just wants the frame sent), so TX always uses whichever SF
+    // we're currently dwelling on.
+    let mut sf_table_index: usize = 0;
 
     loop {
+        let sf_index = (sf_table_index % SF_TABLE.len()) as u8;
+        sf_table_index = sf_table_index.wrapping_add(1);
+        let sf = sf_from_index(sf_index);
+        let mod_params = match lora.create_modulation_params(sf, BANDWIDTH, CODING_RATE, FREQ_HZ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("OTA bridge: mod params err: {}", e);
+                return;
+            }
+        };
+
         // Race "a host frame/command arrived" against "a LoRa OTA reply
         // arrived" — whichever happens first gets handled, so this bridge
-        // never has to guess which side will speak next.
+        // never has to guess which side will speak next. The RX side is
+        // capped at a short dwell per SF so we keep rotating through
+        // SF_TABLE even while nothing is heard.
         let rx_pkt_params = match lora.create_rx_packet_params(
             PREAMBLE_LEN,
             false,
@@ -392,7 +204,10 @@ where
 
         let mut rx_buf = [0u8; MAX_LORA_PAYLOAD];
         let host_fut = host_log::HOST_CMD.receive();
-        let radio_fut = lora.rx(&rx_pkt_params, &mut rx_buf);
+        let radio_fut = with_timeout(
+            Duration::from_millis(400),
+            lora.rx(&rx_pkt_params, &mut rx_buf),
+        );
 
         match embassy_futures::select::select(host_fut, radio_fut).await {
             embassy_futures::select::Either::First(cmd) => match cmd {
@@ -419,15 +234,15 @@ where
                         warn!("OTA bridge: prepare_for_tx err: {}", e);
                         continue;
                     }
-                    if let Err(e) = lora.tx().await {
-                        warn!("OTA bridge: tx err: {}", e);
+                    if with_timeout(Duration::from_secs(5), lora.tx()).await.is_err() {
+                        warn!("OTA bridge: tx() TIMED OUT waiting for DIO1");
                     }
                 }
                 HostCmd::Line(_) => {} // ignore any other text line while bridging
                 HostCmd::IoFrame(_) => {} // not relevant to OTA bridge mode
             },
             embassy_futures::select::Either::Second(rx_result) => match rx_result {
-                Ok((len, _status)) => {
+                Ok(Ok((len, _status))) => {
                     let buf = &rx_buf[..len as usize];
                     if buf.first() == Some(&ota::MAGIC) {
                         host_log::push_ota_frame(buf);
@@ -436,9 +251,14 @@ where
                     // node's ping/pong) is silently ignored — this bridge
                     // only forwards OTA frames to the host.
                 }
-                Err(RadioError::ReceiveTimeout) => {}
-                Err(e) => {
+                Ok(Err(RadioError::ReceiveTimeout)) => {}
+                Ok(Err(e)) => {
                     warn!("OTA bridge: rx err: {}", e);
+                }
+                Err(_timeout) => {
+                    // Per-SF dwell elapsed with nothing heard — rotate to
+                    // the next SF on the next loop iteration.
+                    let _ = lora.enter_standby().await;
                 }
             },
         }
@@ -520,8 +340,8 @@ where
                         warn!("IO bridge: prepare_for_tx err: {}", e);
                         continue;
                     }
-                    if let Err(e) = lora.tx().await {
-                        warn!("IO bridge: tx err: {}", e);
+                    if with_timeout(Duration::from_secs(5), lora.tx()).await.is_err() {
+                        warn!("IO bridge: tx() TIMED OUT waiting for DIO1");
                     }
                 }
                 HostCmd::Line(_) => {} // ignore any other text line while bridging
