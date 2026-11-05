@@ -44,6 +44,7 @@ use lora_phy::{LoRa, RxMode};
 use lora_dx_lr30_range_test::battery::BatteryMonitor;
 use lora_dx_lr30_range_test::device_id::{BROADCAST, DEVICE_ID};
 use lora_dx_lr30_range_test::host_log;
+use lora_dx_lr30_range_test::io;
 use lora_dx_lr30_range_test::ota;
 use lora_dx_lr30_range_test::protocol::{
     sf_from_index, Kind as PingKind, Packet as PingPacket, FREQ_HZ, PACKET_LEN, SF_TABLE, TX_POWER_DBM,
@@ -61,6 +62,24 @@ use panic_probe as _;
 
 /// See repeater.rs's `SEEN_LEN`.
 const SEEN_LEN: usize = 8;
+
+/// See repeater.rs's `IO_SEEN_LEN` — same role, for `io::Packet`
+/// (relay/sensor) traffic, which has no `seq` field so dedup keys on a
+/// content hash of the raw payload bytes instead of (kind, seq).
+const IO_SEEN_LEN: usize = 8;
+
+/// Tiny non-cryptographic hash (FNV-1a) of an io::Packet's raw bytes —
+/// good enough to distinguish "packet I already forwarded" from "a new
+/// one", not meant to resist adversarial collisions on a trusted LoRa
+/// link with a handful of devices. Mirrors repeater.rs's helper.
+fn io_payload_hash(buf: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in buf {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
 
 /// How recently this repeater must have forwarded a given telemetry
 /// `device_id` before it suppresses a repeat — shorter than
@@ -159,6 +178,10 @@ async fn main(spawner: Spawner) {
     // instead).
     let mut seen_telemetry: [(u8, Instant); SEEN_LEN] = [(0xFF, Instant::from_ticks(0)); SEEN_LEN];
     let mut seen_telemetry_next = 0usize;
+    // Dedup for FORWARDED io::Packet (relay/sensor) traffic — see
+    // IO_SEEN_LEN's doc comment.
+    let mut io_seen: [u32; IO_SEEN_LEN] = [0; IO_SEEN_LEN];
+    let mut io_seen_next = 0usize;
     // Own battery telemetry — see telemetry.rs for why this is a separate
     // broadcast instead of relying on PONG-stamping (which a downstream
     // repeater on the same chain would overwrite before it reaches node_a).
@@ -246,6 +269,45 @@ async fn main(spawner: Spawner) {
 
         if buf.first() == Some(&ota::MAGIC) {
             handle_ota(&mut lora, &mod_params, &mut ota_rx, buf).await;
+            continue;
+        }
+
+        // Forward io::Packet (relay/sensor) traffic verbatim — same
+        // dumb-forward shape as the ping/pong repeating below, dedup on
+        // a content hash since io::Packet has no seq field (see
+        // IO_SEEN_LEN's doc comment). This is the frame shape node_a's
+        // run_io_bridge sends/relays for tools/io_mqtt_bridge.py — without
+        // this branch the repeater would just see "bad magic/version" and
+        // drop it, as happened before this was added.
+        if buf.first() == Some(&io::MAGIC) {
+            let hash = io_payload_hash(buf);
+            let already_seen = io_seen.iter().any(|&h| h == hash);
+            if already_seen {
+                continue;
+            }
+            io_seen[io_seen_next] = hash;
+            io_seen_next = (io_seen_next + 1) % IO_SEEN_LEN;
+
+            led.toggle();
+            info!("repeating io frame ({} bytes)", buf.len());
+            host_log!("repeating io frame ({} bytes)", buf.len());
+            Timer::after(Duration::from_millis(repeat_delay_ms(hash as u16))).await;
+
+            let mut tx_pkt_params =
+                match lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mod_params) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("io forward: tx pkt params err: {}", e);
+                        continue;
+                    }
+                };
+            if let Err(e) = lora.prepare_for_tx(&mod_params, &mut tx_pkt_params, TX_POWER_DBM, buf).await {
+                warn!("io forward: prepare_for_tx err: {}", e);
+                continue;
+            }
+            if with_timeout(Duration::from_secs(5), lora.tx()).await.is_err() {
+                warn!("io forward: tx() TIMED OUT waiting for DIO1");
+            }
             continue;
         }
 
